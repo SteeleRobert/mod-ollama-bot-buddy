@@ -364,6 +364,54 @@ namespace BotBuddyAI
         return false;
     }
 
+    // A quest giver whose quest you already hold, and have not finished, offers
+    // nothing when you talk to it. Returning a bare false there sends the model
+    // straight back to the same NPC - it talked to Sten Stoutarm 45 times in a row.
+    // Name the quest and the objective that is short.
+    std::string NothingToDoWithQuestGiver(Player* bot, WorldObject* questGiver)
+    {
+        for (auto const& qs : bot->getQuestStatusMap())
+        {
+            if (qs.second.Status != QUEST_STATUS_INCOMPLETE) continue;
+
+            Quest const* quest = sObjectMgr->GetQuestTemplate(qs.first);
+            if (!quest) continue;
+
+            for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+            {
+                if (uint32 itemId = quest->RequiredItemId[i])
+                {
+                    uint32 have = bot->GetItemCount(itemId, true);
+                    uint32 need = quest->RequiredItemCount[i];
+                    if (have >= need) continue;
+
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+                    return fmt::format(
+                        "{} has nothing for you - you already have \"{}\" and it is not finished. "
+                        "You still need {} more {}. Go and get them, then come back",
+                        questGiver->GetName(), quest->GetTitle(), need - have,
+                        proto ? proto->Name1 : "of the quest item");
+                }
+
+                if (quest->RequiredNpcOrGo[i] > 0)
+                {
+                    uint32 have = bot->GetReqKillOrCastCurrentCount(qs.first, quest->RequiredNpcOrGo[i]);
+                    uint32 need = quest->RequiredNpcOrGoCount[i];
+                    if (have >= need) continue;
+
+                    return fmt::format(
+                        "{} has nothing for you - you already have \"{}\" and it is not finished. "
+                        "You still need {} more. Go and do that, then come back",
+                        questGiver->GetName(), quest->GetTitle(), need - have);
+                }
+            }
+        }
+
+        return fmt::format(
+            "{} has no quest for you right now - nothing to take and nothing to hand in. "
+            "Go and do something else", questGiver->GetName());
+    }
+
     bool InteractWithQuestGiver(Player* bot, WorldObject* questGiver)
     {
         if (!bot || !questGiver) return false;
@@ -372,8 +420,12 @@ namespace BotBuddyAI
         if (!ai) return false;
 
         // Check interaction distance
-        if (bot->GetDistance(questGiver) > INTERACTION_DISTANCE)
+        float qgDist = bot->GetDistance(questGiver);
+        if (qgDist > INTERACTION_DISTANCE)
         {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far to talk to {} ({:.1f}y away, need {:.1f}y) - move closer first",
+                questGiver->GetName(), qgDist, (float)INTERACTION_DISTANCE));
             return false;
         }
 
@@ -443,15 +495,24 @@ namespace BotBuddyAI
             
             // Fallback to basic gossip hello action
             Event event = Event("", std::to_string(guid.GetCounter()));
-            return ai->DoSpecificAction("gossip hello", event);
+            if (ai->DoSpecificAction("gossip hello", event))
+                return true;
+
+            BotBuddy::SetLastOutcome(bot, false, NothingToDoWithQuestGiver(bot, questGiver));
+            return false;
         }
         else if (GameObject* go = questGiver->ToGameObject())
         {
             // Use game object interaction
             Event event = Event("", go->GetGOInfo()->name);
-            return ai->DoSpecificAction("use", event);
+            if (ai->DoSpecificAction("use", event))
+                return true;
+
+            BotBuddy::SetLastOutcome(bot, false, NothingToDoWithQuestGiver(bot, questGiver));
+            return false;
         }
 
+        BotBuddy::SetLastOutcome(bot, false, NothingToDoWithQuestGiver(bot, questGiver));
         return false;
     }
 

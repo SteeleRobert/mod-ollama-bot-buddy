@@ -8,6 +8,7 @@ std::unordered_set<std::string> g_OllamaBotControlBotNames;
 
 uint32 g_OllamaBotBuddyHistoryDepth = 6;
 bool g_EnableOllamaBotBuddyJournal = true;
+bool g_OllamaBotBuddyStrictSchema = true;
 bool g_EnableOllamaBotControl = true;
 std::string g_OllamaBotControlUrl = "http://localhost:11434/api/generate";
 std::string g_OllamaBotControlModel = "llama3.2:1b";
@@ -29,6 +30,7 @@ void OllamaBotControlConfigWorldScript::OnStartup()
     // until a bot is explicitly designated.
     g_OllamaBotBuddyHistoryDepth = sConfigMgr->GetOption<uint32>("OllamaBotControl.HistoryDepth", 6);
     g_EnableOllamaBotBuddyJournal = sConfigMgr->GetOption<bool>("OllamaBotControl.Journal", true);
+    g_OllamaBotBuddyStrictSchema = sConfigMgr->GetOption<bool>("OllamaBotControl.StrictSchema", true);
     if (g_EnableOllamaBotBuddyJournal)
         BotBuddy::EnsureSchema();
 

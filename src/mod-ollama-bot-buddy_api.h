@@ -6,6 +6,7 @@
 enum class BotControlCommandType
 {
     MoveTo,
+    MoveToTarget,
     Attack,
     Interact,
     CastSpell,

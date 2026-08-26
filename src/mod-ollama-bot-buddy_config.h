@@ -14,6 +14,9 @@ extern std::unordered_set<std::string> g_OllamaBotControlBotNames;
 extern uint32 g_OllamaBotBuddyHistoryDepth;
 // Persist every decision to mod_ollama_bot_buddy_journal.
 extern bool g_EnableOllamaBotBuddyJournal;
+// Constrain replies with a full JSON schema. Ollama's MLX runner ignores schemas
+// (ollama/ollama#17013); set false there to fall back to plain "json".
+extern bool g_OllamaBotBuddyStrictSchema;
 
 class OllamaBotControlConfigWorldScript : public WorldScript
 {

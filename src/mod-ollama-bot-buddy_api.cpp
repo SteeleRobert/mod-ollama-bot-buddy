@@ -832,6 +832,49 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                 return false;
             }
             break;
+        case BotControlCommandType::MoveToTarget:
+            if (!command.args.empty())
+            {
+                uint32 lowGuid = 0;
+                try { lowGuid = std::stoul(command.args[0]); }
+                catch (...) { return false; }
+
+                WorldObject* target = nullptr;
+                for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                    if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
+                        { target = pair.second; break; }
+                if (!target)
+                    for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
+                        if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
+                            { target = pair.second; break; }
+
+                if (!target)
+                {
+                    BotBuddy::SetLastOutcome(bot, false, "no such target in this area");
+                    return false;
+                }
+
+                float dist = bot->GetDistance(target);
+                if (dist <= INTERACTION_DISTANCE)
+                {
+                    BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                        "already next to {} ({:.1f}y) - you can interact or attack now",
+                        target->GetName(), dist));
+                    return true;
+                }
+
+                // Stand just inside interaction range on the near side of the target.
+                float angle = target->GetAngle(bot);
+                float destX = target->GetPositionX() + cos(angle) * 3.0f;
+                float destY = target->GetPositionY() + sin(angle) * 3.0f;
+                float destZ = target->GetPositionZ();
+                bot->GetMotionMaster()->Clear();
+                bot->GetMotionMaster()->MovePoint(0, destX, destY, destZ);
+                BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                    "walking to {} ({:.1f}y away)", target->GetName(), dist));
+                return true;
+            }
+            break;
         case BotControlCommandType::Interact:
             if (!command.args.empty())
             {

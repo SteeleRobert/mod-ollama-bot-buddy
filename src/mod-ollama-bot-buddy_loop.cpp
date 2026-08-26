@@ -169,6 +169,17 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 return false;
             }
         }
+        else if (type == "move_to_target")
+        {
+            // Let the pathing engine work out the route; the model only names a target.
+            if (params.contains("guid")) {
+                command.type = BotControlCommandType::MoveToTarget;
+                command.args = { std::to_string(params["guid"].get<uint32_t>()) };
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] move_to_target missing guid");
+                return false;
+            }
+        }
         else if (type == "attack")
         {
             if (params.contains("guid")) {
@@ -1223,24 +1234,79 @@ static std::string QueryOllamaLLM(const std::string& prompt)
         return "";
     }
 
-    // Constrain generation to the command schema. Without this the model emits
-    // JSON-ish prose and roughly a quarter of replies fail to parse, which cost
-    // a full decision cycle each. Ollama enforces the schema during sampling.
-    nlohmann::json schema = {
-        {"type", "object"},
-        {"properties", {
-            {"command", {
+    // Constrain the reply. Unconstrained, the model answers in markdown prose and
+    // the decision is discarded - roughly a quarter of them were lost that way.
+    //
+    // A full schema is much stronger than plain "json": it pins the command enum,
+    // the parameter names, and their types, so a reply cannot be well-formed JSON
+    // that is still unusable (an "attack" with empty params, or a guid as a string).
+    // Each command carries different parameters, so the schema branches on the
+    // command type rather than accepting any object.
+    //
+    // Caveat: Ollama's MLX runner accepts a schema and silently ignores it
+    // (ollama/ollama#17013, #16563), while the GGUF/llama.cpp runner enforces it.
+    // On an MLX model, set OllamaBotControl.StrictSchema = 0 to fall back to plain
+    // "json" - or better, use the GGUF build of the same model.
+    auto guidCmd = [](char const* name)
+    {
+        return nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"type",   {{"const", name}}},
+                {"params", {{"type", "object"},
+                            {"properties", {{"guid", {{"type", "integer"}}}}},
+                            {"required", {"guid"}}}}
+            }},
+            {"required", {"type", "params"}}
+        };
+    };
+
+    nlohmann::json commandSchema = {
+        {"oneOf", {
+            // move_to needs real coordinates, not a target
+            {
                 {"type", "object"},
                 {"properties", {
-                    {"type", {{"type", "string"},
-                              {"enum", {"move_to", "attack", "interact", "loot", "spell",
-                                        "accept_quest", "turn_in_quest", "stop", "say"}}}},
+                    {"type",   {{"const", "move_to"}}},
+                    {"params", {{"type", "object"},
+                                {"properties", {{"x", {{"type", "number"}}},
+                                                {"y", {{"type", "number"}}},
+                                                {"z", {{"type", "number"}}}}},
+                                {"required", {"x", "y", "z"}}}}
+                }},
+                {"required", {"type", "params"}}
+            },
+            guidCmd("attack"),
+            guidCmd("interact"),
+            guidCmd("move_to_target"),
+            // loot takes no parameters
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"type",   {{"const", "loot"}}},
                     {"params", {{"type", "object"}}}
                 }},
                 {"required", {"type", "params"}}
-            }},
+            },
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"type",   {{"enum", {"accept_quest", "turn_in_quest"}}}},
+                    {"params", {{"type", "object"},
+                                {"properties", {{"id", {{"type", "integer"}}}}},
+                                {"required", {"id"}}}}
+                }},
+                {"required", {"type", "params"}}
+            }
+        }}
+    };
+
+    nlohmann::json schema = {
+        {"type", "object"},
+        {"properties", {
+            {"command",   commandSchema},
             {"reasoning", {{"type", "string"}}},
-            {"say", {{"type", "string"}}}
+            {"say",       {{"type", "string"}}}
         }},
         {"required", {"command", "reasoning"}}
     };
@@ -1249,7 +1315,7 @@ static std::string QueryOllamaLLM(const std::string& prompt)
         {"model",  g_OllamaBotControlModel},
         {"prompt", prompt},
         {"stream", false},
-        {"format", schema}
+        {"format", g_OllamaBotBuddyStrictSchema ? schema : nlohmann::json("json")}
     };
     std::string requestDataStr = requestData.dump();
 
@@ -1448,7 +1514,16 @@ How to choose:
 - You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
 - Loot creatures marked DEAD. Attack only living ones.
 
-Reply with your chosen command, a short reasoning, and optionally something to say out loud.)";
+Reply with a single JSON object and nothing else, in exactly this shape:
+{"command":{"type":"<one of: move_to_target, move_to, attack, interact, loot, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
+
+params by command type:
+  move_to      {"x":<float>,"y":<float>,"z":<float>}
+  attack       {"guid":<guid from your visible list>}
+  interact     {"guid":<guid from your visible list>}
+  loot         {}
+  accept_quest {"id":<quest id>}
+  turn_in_quest{"id":<quest id>})";
 
 
     return oss.str();

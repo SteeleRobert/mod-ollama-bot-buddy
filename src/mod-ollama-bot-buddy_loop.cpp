@@ -143,9 +143,23 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 if (distanceFromBot > maxDistanceFromBot) {
                     LOG_DEBUG("server.loading", "[OllamaBotBuddy] Move_to destination too far from bot: ({}, {}, {}) - Distance: {:.1f}", 
                              destX, destY, destZ, distanceFromBot);
+                    BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                        "that point is {:.0f}y away, too far to walk in one move (limit {:.0f}y) - "
+                        "pick somewhere closer and travel in stages",
+                        distanceFromBot, maxDistanceFromBot));
                     return false;
                 }
-                
+
+                // Already standing there. PathGenerator returns NOPATH for a zero-length
+                // path, so without this the bot rejects its own position as unreachable
+                // and the model, told only that the move failed, asks for it again.
+                if (distanceFromBot < 1.0f) {
+                    BotBuddy::SetLastOutcome(bot, false,
+                        "you are already standing on that spot - moving there again does nothing. "
+                        "You have arrived, so do the thing you came here to do");
+                    return false;
+                }
+
                 // Validate that the destination is pathable like a real player would
                 PathGenerator pathValidator(bot);
                 pathValidator.CalculatePath(destX, destY, destZ, false);
@@ -155,6 +169,10 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 if (pathType & PATHFIND_NOPATH) {
                     LOG_DEBUG("server.loading", "[OllamaBotBuddy] No valid path for move_to: ({}, {}, {}) - PathType: {}", 
                              destX, destY, destZ, pathType);
+                    BotBuddy::SetLastOutcome(bot, false,
+                        "there is no walkable route to that point - it is off the map, inside "
+                        "terrain, or across water. Pick a different spot, or use move_to_target "
+                        "with a guid and let the pathing work it out");
                     return false; // Only reject if completely impossible to path
                 }
                 
@@ -166,6 +184,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 };
             } else {
                 LOG_ERROR("server.loading", "[OllamaBotBuddy] move_to missing parameter");
+                BotBuddy::SetLastOutcome(bot, false, "move_to needs all three of x, y and z as numbers");
                 return false;
             }
         }
@@ -177,6 +196,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 command.args = { std::to_string(params["guid"].get<uint32_t>()) };
             } else {
                 LOG_ERROR("server.loading", "[OllamaBotBuddy] move_to_target missing guid");
+                BotBuddy::SetLastOutcome(bot, false, "move_to_target needs a \"guid\" from your visible list");
                 return false;
             }
         }
@@ -249,6 +269,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 command.args = { std::to_string(targetGuid) };
             } else {
                 LOG_ERROR("server.loading", "[OllamaBotBuddy] attack missing guid");
+                BotBuddy::SetLastOutcome(bot, false, "attack needs a \"guid\" from your visible list");
                 return false;
             }
         }
@@ -259,6 +280,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 command.args = { std::to_string(params["guid"].get<uint32_t>()) };
             } else {
                 LOG_ERROR("server.loading", "[OllamaBotBuddy] interact missing guid");
+                BotBuddy::SetLastOutcome(bot, false, "interact needs a \"guid\" from your visible list");
                 return false;
             }
         }
@@ -288,6 +310,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 command.args = { std::to_string(params["id"].get<uint32_t>()) };
             } else {
                 LOG_ERROR("server.loading", "[OllamaBotBuddy] accept_quest missing id");
+                BotBuddy::SetLastOutcome(bot, false, "accept_quest needs the quest \"id\"");
                 return false;
             }
         }
@@ -298,6 +321,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 command.args = { std::to_string(params["id"].get<uint32_t>()) };
             } else {
                 LOG_ERROR("server.loading", "[OllamaBotBuddy] turn_in_quest missing id");
+                BotBuddy::SetLastOutcome(bot, false, "turn_in_quest needs the quest \"id\"");
                 return false;
             }
         }
@@ -312,6 +336,9 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
         else
         {
             LOG_ERROR("server.loading", "[OllamaBotBuddy] Unknown command type '{}'", type);
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "\"{}\" is not a command you have - use one of the commands listed at the end "
+                "of these instructions, spelled exactly as shown", type));
             return false;
         }
 

@@ -45,7 +45,9 @@ namespace BotBuddyAI
     bool InteractWithQuestGiver(Player* bot, WorldObject* questGiver);
     bool AutoNavigateGossipForQuests(Player* bot, Creature* creature);
     bool HasQuestsAvailable(Player* bot, WorldObject* questGiver);
-    bool LootNearby(Player* bot);
+    /// Loot a corpse. lowGuid is the guid the model saw in its visible list;
+    /// 0 means "the nearest corpse you are allowed to loot".
+    bool LootCorpse(Player* bot, uint32 lowGuid);
     bool Interact(Player* bot, ObjectGuid guid);
     
     // Quest-related helper functions

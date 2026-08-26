@@ -277,6 +277,9 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
         else if (type == "loot")
         {
             command.type = BotControlCommandType::Loot;
+            // Optional: without a guid we loot the nearest corpse we own.
+            if (params.contains("guid") && params["guid"].is_number())
+                command.args = { std::to_string(params["guid"].get<uint32_t>()) };
         }
         else if (type == "accept_quest")
         {
@@ -1279,12 +1282,15 @@ static std::string QueryOllamaLLM(const std::string& prompt)
             guidCmd("attack"),
             guidCmd("interact"),
             guidCmd("move_to_target"),
-            // loot takes no parameters
+            // loot names the corpse it is looting, so a failure can be attributed
+            // to a specific target rather than to "looting" in the abstract.
             {
                 {"type", "object"},
                 {"properties", {
                     {"type",   {{"const", "loot"}}},
-                    {"params", {{"type", "object"}}}
+                    {"params", {{"type", "object"},
+                                {"properties", {{"guid", {{"type", "integer"}}}}},
+                                {"required", {"guid"}}}}
                 }},
                 {"required", {"type", "params"}}
             },
@@ -1512,7 +1518,8 @@ How to choose:
 - Prefer whatever advances a quest objective listed above.
 - Only act on creatures, objects and NPCs that appear in your visible list, using the exact guid shown there.
 - You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
-- Loot creatures marked DEAD. Attack only living ones.
+- Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
+- Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
 
 Reply with a single JSON object and nothing else, in exactly this shape:
 {"command":{"type":"<one of: move_to_target, move_to, attack, interact, loot, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
@@ -1521,7 +1528,7 @@ params by command type:
   move_to      {"x":<float>,"y":<float>,"z":<float>}
   attack       {"guid":<guid from your visible list>}
   interact     {"guid":<guid from your visible list>}
-  loot         {}
+  loot         {"guid":<guid of a corpse marked DEAD (LOOTABLE)>}
   accept_quest {"id":<quest id>}
   turn_in_quest{"id":<quest id>})";
 

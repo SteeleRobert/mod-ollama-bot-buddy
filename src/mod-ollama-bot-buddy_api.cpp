@@ -18,6 +18,7 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include "GossipDef.h"
+#include "LootMgr.h"
 #include <sstream>
 
 // Constants for interaction and combat ranges
@@ -754,16 +755,184 @@ namespace BotBuddyAI
         return true;
     }
 
-    bool LootNearby(Player* bot)
+    namespace
     {
-        if (!bot) return false;
+        // A corpse this bot is allowed to loot: dead, flagged lootable, and either
+        // tagged by us or by our group.
+        bool BotMayLoot(Player* bot, Creature* c)
+        {
+            if (!c || !c->isDead()) return false;
+            if (!c->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE)) return false;
+            if (!c->hasLootRecipient()) return false;
+            if (c->GetLootRecipient() == bot) return true;
+            return c->GetLootRecipientGroup() && bot->GetGroup() == c->GetLootRecipientGroup();
+        }
 
-        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (!ai) return false;
+        Creature* NearestLootableCorpse(Player* bot, float radius)
+        {
+            Creature* best = nullptr;
+            float bestDist = radius;
+            for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+            {
+                Creature* c = pair.second;
+                if (!BotMayLoot(bot, c)) continue;
+                float d = bot->GetDistance(c);
+                if (d <= bestDist) { bestDist = d; best = c; }
+            }
+            return best;
+        }
+    }
 
-        // Use the bot's AI system to handle looting
-        Event event = Event("", "");
-        return ai->DoSpecificAction("loot", event);
+    // Loot a corpse outright.
+    //
+    // The classic playerbots "loot" action cannot be used here: it is gated on the
+    // LootObjectStack, which is only filled by AddLootAction under the loot strategy -
+    // and the LLM harness calls ClearStrategies() on every engine, so that stack is
+    // permanently empty and the action returns false forever. Likewise StoreLootAction
+    // is a packet handler registered by that same strategy, so even a CMSG_LOOT would
+    // never store anything. We therefore drain the corpse directly, which is also
+    // synchronous - we know what was picked up and can say so in the outcome.
+    bool LootCorpse(Player* bot, uint32 lowGuid)
+    {
+        if (!bot || !bot->GetMap()) return false;
+
+        Creature* corpse = nullptr;
+        if (lowGuid)
+        {
+            // Resolve the low guid the model saw in its visible list. ObjectGuid::Create
+            // needs the creature entry too, which the model has no way to know, so scan.
+            for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
+                    { corpse = pair.second; break; }
+            if (!corpse)
+            {
+                BotBuddy::SetLastOutcome(bot, false,
+                    "nothing with that guid is here any more - it despawned; pick a target from your visible list");
+                return false;
+            }
+            if (corpse->IsAlive())
+            {
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "{} is alive ({}/{} hp), not a corpse - kill it before looting it",
+                    corpse->GetName(), corpse->GetHealth(), corpse->GetMaxHealth()));
+                return false;
+            }
+        }
+        else
+        {
+            // No target named: fall back to the nearest corpse we own.
+            corpse = NearestLootableCorpse(bot, 30.0f);
+            if (!corpse)
+            {
+                BotBuddy::SetLastOutcome(bot, false,
+                    "there is no corpse near you that you can loot - you only get loot from things you killed yourself, "
+                    "and only while they are still marked DEAD (LOOTABLE) in your visible list");
+                return false;
+            }
+        }
+
+        float distance = bot->GetDistance(corpse);
+        if (distance > INTERACTION_DISTANCE)
+        {
+            float angle = corpse->GetAngle(bot);
+            bot->GetMotionMaster()->Clear();
+            bot->GetMotionMaster()->MovePoint(0,
+                corpse->GetPositionX() + cos(angle + M_PI) * 2.0f,
+                corpse->GetPositionY() + sin(angle + M_PI) * 2.0f,
+                corpse->GetPositionZ());
+
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far to loot {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                corpse->GetName(), distance, (float)INTERACTION_DISTANCE));
+            return false;
+        }
+
+        if (!corpse->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} has nothing left on it - it is already looted. Stop looting it and do something else",
+                corpse->GetName()));
+            return false;
+        }
+
+        if (!BotMayLoot(bot, corpse))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is not yours to loot - somebody else killed it. Kill your own targets to get loot",
+                corpse->GetName()));
+            return false;
+        }
+
+        if (bot->IsMounted()) bot->Dismount();
+        if (bot->isMoving())  bot->StopMoving();
+
+        Loot* loot = &corpse->loot;
+        bot->SetLootGUID(corpse->GetGUID());
+        loot->FillNotNormalLootFor(bot);
+        loot->AddLooter(bot->GetGUID());
+
+        std::vector<std::string> taken;
+        uint32 gold = loot->gold;
+
+        if (gold)
+        {
+            bot->ModifyMoney(gold);
+            loot->gold = 0;
+            loot->NotifyMoneyRemoved();
+        }
+
+        // GetMaxSlotInLootFor covers the normal items plus this player's quest/FFA/
+        // conditional lists, so quest drops are picked up like anything else.
+        uint32 maxSlot = loot->GetMaxSlotInLootFor(bot);
+        std::string blocked;
+        for (uint32 slot = 0; slot < maxSlot; ++slot)
+        {
+            InventoryResult msg = EQUIP_ERR_OK;
+            LootItem* item = bot->StoreLootItem(uint8(slot), loot, msg);
+            if (item && msg == EQUIP_ERR_OK)
+            {
+                if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item->itemid))
+                    taken.push_back(item->count > 1
+                        ? fmt::format("{}x {}", uint32(item->count), proto->Name1)
+                        : proto->Name1);
+            }
+            else if (msg == EQUIP_ERR_INVENTORY_FULL)
+            {
+                blocked = "your bags are full";
+            }
+        }
+
+        bot->SetLootGUID(ObjectGuid::Empty);
+        loot->RemoveLooter(bot->GetGUID());
+
+        if (loot->isLooted())
+        {
+            corpse->AllLootRemovedFromCorpse();
+            corpse->RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE);
+        }
+
+        if (taken.empty() && !gold)
+        {
+            BotBuddy::SetLastOutcome(bot, false, blocked.empty()
+                ? fmt::format("{} had nothing you could take", corpse->GetName())
+                : fmt::format("could not loot {} - {}", corpse->GetName(), blocked));
+            return false;
+        }
+
+        std::string got;
+        for (size_t i = 0; i < taken.size(); ++i)
+            got += (i ? ", " : "") + taken[i];
+        if (gold)
+            got += fmt::format("{}{} copper", taken.empty() ? "" : ", ", gold);
+
+        BotBuddy::SetLastOutcome(bot, true,
+            fmt::format("looted {} from {}", got, corpse->GetName()));
+
+        if (g_EnableOllamaBotBuddyDebug)
+            LOG_INFO("server.loading", "[OllamaBotBuddy] {} looted {} from {}",
+                bot->GetName(), got, corpse->GetName());
+
+        return true;
     }
 
 } // namespace BotBuddyAI
@@ -1005,7 +1174,18 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
             }
             break;
         case BotControlCommandType::Loot:
-            return BotBuddyAI::LootNearby(bot);
+        {
+            // Optional target: the model names a corpse, or we take the nearest one.
+            uint32 lootGuid = 0;
+            if (!command.args.empty())
+            {
+                try { lootGuid = std::stoul(command.args[0]); }
+                catch (const std::exception&) {
+                    LOG_ERROR("server.loading", "[OllamaBotBuddy] Invalid loot guid '{}'", command.args[0]);
+                }
+            }
+            return BotBuddyAI::LootCorpse(bot, lootGuid);
+        }
         default:
             break;
     }
@@ -1179,6 +1359,8 @@ std::string FormatCommandString(const BotControlCommand& command)
             break;
         case BotControlCommandType::Loot:
             ss << "loot";
+            for (const auto& arg : command.args)
+                ss << " " << arg;
             break;
         case BotControlCommandType::Follow:
             ss << "follow";

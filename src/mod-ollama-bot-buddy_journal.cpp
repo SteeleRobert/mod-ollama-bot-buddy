@@ -54,16 +54,58 @@ namespace BotBuddy
         auto const& dq = it->second;
         size_t start = dq.size() > count ? dq.size() - count : 0;
 
+        // Identical repeated failures get collapsed rather than listed one by one.
+        // Six separate lines of the same failure read as six unlucky attempts and
+        // invite the model to try a seventh; "x6" reads as a fact about the world.
+        auto sameAttempt = [](ActionRecord const& a, ActionRecord const& b)
+        {
+            return a.command == b.command && a.params == b.params && a.outcome == b.outcome;
+        };
+
         std::string out = "Your last actions, oldest first:\n";
-        for (size_t i = start; i < dq.size(); ++i)
+        for (size_t i = start; i < dq.size(); )
         {
             ActionRecord const& r = dq[i];
+            size_t j = i + 1;
+            while (j < dq.size() && sameAttempt(r, dq[j])) ++j;
+            size_t repeats = j - i;
+
             out += "- " + r.command;
             if (!r.params.empty()) out += " " + r.params;
             out += r.succeeded ? "  -> worked" : "  -> DID NOT WORK";
             if (!r.outcome.empty()) out += ": " + r.outcome;
+            if (repeats > 1)
+                out += "  [you did this " + std::to_string(repeats) + " times in a row"
+                     + (r.succeeded ? "]" : ", with the same result every time]");
             out += "\n";
-            if (!r.reasoning.empty()) out += "  (you said: " + r.reasoning + ")\n";
+            // Only the most recent justification is worth showing; the rest are
+            // restatements of it and just crowd the window.
+            if (!r.reasoning.empty())
+                out += "  (you said: " + dq[j - 1].reasoning + ")\n";
+
+            i = j;
+        }
+
+        // A failure the model has already repeated needs to be stated as a
+        // conclusion, not left for it to infer from a list it can rationalise past.
+        ActionRecord const& last = dq.back();
+        if (!last.succeeded)
+        {
+            size_t streak = 0;
+            for (size_t i = dq.size(); i-- > 0; )
+            {
+                if (dq[i].succeeded || !sameAttempt(dq[i], last)) break;
+                ++streak;
+            }
+            if (streak >= 2)
+            {
+                out += "\nSTOP: \"" + last.command;
+                if (!last.params.empty()) out += " " + last.params;
+                out += "\" has now failed " + std::to_string(streak)
+                     + " times in a row for the same reason. It will keep failing. "
+                       "Do not choose it again this turn - the reason it failed is a "
+                       "fact about the world, not bad luck. Pick a different command.\n";
+            }
         }
         return out;
     }

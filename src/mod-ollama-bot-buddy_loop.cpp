@@ -1584,7 +1584,8 @@ How to choose:
 - You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
 - Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
 - Anything marked [IN RANGE - ...] is close enough already, and the mark says which command to use on it. Use that command this turn; do not move to it again.
-- In a fight, use your abilities with cast - attack alone only swings your weapon, and your energy or mana is wasted sitting at full. Spend combo points with your finisher once you have built a few.
+- attack starts the fight and hands it to your character's combat training: the full ability rotation, positioning and targeting run automatically until the fight ends, and you decide again afterwards. Pick the target; do not micro-manage the fight.
+- cast is for out-of-combat abilities: Stealth before approaching danger, Throw to pull something from range, a heal or buff before the next fight.
 - interact is only for NPCs and objects you can talk to or use. Beasts and monsters are not; you attack those.
 - Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
 
@@ -1610,6 +1611,7 @@ namespace
     {
         std::atomic<bool> busy { false };
         time_t lastRequest { 0 };
+        bool strategiesConfigured { false };
     };
     std::unordered_map<uint64_t, OllamaBotState> ollamaBotStates;
 
@@ -1729,19 +1731,40 @@ void OllamaBotControlLoop::OnUpdate(uint32 /*diff*/)
         // under LLM control; every other bot keeps its normal playerbot AI.
         if (g_OllamaBotControlBotNames.find(botName) == g_OllamaBotControlBotNames.end()) continue;
 
-        // Clear the normal Playerbot AI
+        // Split the brain: the LLM owns the strategic layer (where to go, what to
+        // fight, which quest), the classic playerbot engines keep the tactical
+        // layers. Clearing all three engines - the old behaviour - made every
+        // fight a white-swing auto-attack and left a dead bot lying there forever.
+        //
+        //   COMBAT     kept: the full class rotation from AiFactory runs the fight
+        //   DEAD       kept: release, graveyard run, resurrect
+        //   NON_COMBAT cleared every tick: this is where grind/travel/rpg live,
+        //              and it is exactly the layer the LLM replaces. Re-cleared
+        //              per tick because level-ups call ResetStrategies and would
+        //              quietly hand the bot back to the classic AI.
         PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (ai)
-        {
-            ai->ClearStrategies(BOT_STATE_COMBAT);
-            ai->ClearStrategies(BOT_STATE_NON_COMBAT);
-            ai->ClearStrategies(BOT_STATE_DEAD);
-        } else {
-            continue;
-        }
+        if (!ai) continue;
 
         uint64_t guid = bot->GetGUID().GetRawValue();
         OllamaBotState& state = ollamaBotStates[guid];
+
+        if (!state.strategiesConfigured)
+        {
+            ai->ResetStrategies();   // restore the default engines we may have wiped
+            state.strategiesConfigured = true;
+        }
+        ai->ClearStrategies(BOT_STATE_NON_COMBAT);
+
+        // While the rotation is fighting, hold the LLM's turn. Two decision-makers
+        // driving one MotionMaster fight each other, and a mid-combat "move_to"
+        // would clear the chase the rotation just started. The model gets the
+        // next word when the dust settles.
+        if (bot->IsInCombat()) continue;
+
+        // Death is the dead engine's job too - release, corpse run, resurrect.
+        // The LLM has no verb for any of that, and prompting a corpse just fills
+        // the journal with commands that cannot work.
+        if (!bot->IsAlive()) continue;
 
         // Only process if not already waiting for LLM
         if (!state.busy)

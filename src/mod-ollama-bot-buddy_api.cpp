@@ -905,10 +905,13 @@ namespace BotBuddyAI
         bot->SetLootGUID(ObjectGuid::Empty);
         loot->RemoveLooter(bot->GetGUID());
 
+        // Same teardown the core does in WorldSession::DoLootRelease, so the corpse
+        // stops advertising loot, decays on the looted timer, and turns skinnable.
         if (loot->isLooted())
         {
             corpse->AllLootRemovedFromCorpse();
-            corpse->RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE);
+            corpse->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);
+            loot->clear();
         }
 
         if (taken.empty() && !gold)

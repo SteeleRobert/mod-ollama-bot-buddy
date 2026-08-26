@@ -819,12 +819,17 @@ std::vector<std::string> GetVisibleLocations(Player* bot, float radius = 100.0f)
         }
 
         float dist = bot->GetDistance(c);
+        // State reachability rather than leaving it to be inferred from a float. The
+        // model would stand on top of a target at Distance: 0.0 and keep issuing
+        // move_to "to get in range", because nothing ever told it that it was.
+        std::string reach = dist <= 5.5f ? " [IN RANGE - act on it now]" : " [too far - move closer first]";
         visible.push_back(fmt::format(
-            "{}: {}{}{} (guid: {}, Level: {}, HP: {}/{}, Position: {} {} {}, Distance: {:.1f})",
+            "{}: {}{}{}{} (guid: {}, Level: {}, HP: {}/{}, Position: {} {} {}, Distance: {:.1f})",
             type,
             c->GetName(),
             questGiver,
             questTarget,
+            reach,
             c->GetGUID().GetCounter(),
             c->GetLevel(),
             c->GetHealth(),
@@ -1546,6 +1551,7 @@ How to choose:
 - Only act on creatures, objects and NPCs that appear in your visible list, using the exact guid shown there.
 - You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
 - Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
+- Anything marked [IN RANGE - act on it now] is close enough already. Attack it, loot it or interact with it this turn; do not move to it again.
 - Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
 
 Reply with a single JSON object and nothing else, in exactly this shape:

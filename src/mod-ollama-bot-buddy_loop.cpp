@@ -819,10 +819,25 @@ std::vector<std::string> GetVisibleLocations(Player* bot, float radius = 100.0f)
         }
 
         float dist = bot->GetDistance(c);
-        // State reachability rather than leaving it to be inferred from a float. The
+        // State reachability rather than leaving it to be inferred from a float - the
         // model would stand on top of a target at Distance: 0.0 and keep issuing
-        // move_to "to get in range", because nothing ever told it that it was.
-        std::string reach = dist <= 5.5f ? " [IN RANGE - act on it now]" : " [too far - move closer first]";
+        // move_to "to get in range" - and name the verb that applies, because a bare
+        // "act on it now" gets read as "interact", and the bot spends an hour trying
+        // to strike up a conversation with a wolf.
+        char const* verb =
+            c->isDead()                                            ? "loot it"
+          : c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_QUESTGIVER)   ? "talk to it to take or hand in quests"
+          : c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP)
+            || c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR)
+            || c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_TRAINER)
+            || c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_FLIGHTMASTER)
+            || c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_INNKEEPER)
+            || c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_BANKER)    ? "talk to it"
+          : bot->IsValidAttackTarget(c)                            ? "attack it"
+                                                                   : "leave it alone";
+        std::string reach = dist <= 5.5f
+            ? fmt::format(" [IN RANGE - {}]", verb)
+            : " [too far - move closer first]";
         visible.push_back(fmt::format(
             "{}: {}{}{}{} (guid: {}, Level: {}, HP: {}/{}, Position: {} {} {}, Distance: {:.1f})",
             type,
@@ -861,10 +876,14 @@ std::vector<std::string> GetVisibleLocations(Player* bot, float radius = 100.0f)
         }
         
         float dist = bot->GetDistance(go);
+        std::string goReach = dist <= go->GetInteractionDistance()
+            ? " [IN RANGE - interact with it]"
+            : " [too far - move closer first]";
         visible.push_back(fmt::format(
-            "{}{} (guid: {}, Type: {}, Position: {} {} {}, Distance: {:.1f})",
+            "{}{}{} (guid: {}, Type: {}, Position: {} {} {}, Distance: {:.1f})",
             go->GetName(),
             tag,
+            goReach,
             go->GetGUID().GetCounter(),
             go->GetGoType(),
             go->GetPositionX(),
@@ -1551,7 +1570,8 @@ How to choose:
 - Only act on creatures, objects and NPCs that appear in your visible list, using the exact guid shown there.
 - You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
 - Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
-- Anything marked [IN RANGE - act on it now] is close enough already. Attack it, loot it or interact with it this turn; do not move to it again.
+- Anything marked [IN RANGE - ...] is close enough already, and the mark says which command to use on it. Use that command this turn; do not move to it again.
+- interact is only for NPCs and objects you can talk to or use. Beasts and monsters are not; you attack those.
 - Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
 
 Reply with a single JSON object and nothing else, in exactly this shape:

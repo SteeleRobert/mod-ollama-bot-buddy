@@ -265,12 +265,50 @@ namespace BotBuddyAI
             {
                 return InteractWithQuestGiver(bot, creature);
             }
-            else
+            // Not everything you can stand next to is something you can talk to. A
+            // wolf has no gossip and no quests, so "gossip hello" fails - and saying
+            // only that it failed leaves the model to conclude it should try again.
+            // Name the verb that does apply instead.
+            bool talkable =
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP)       ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR)       ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_TRAINER)      ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_FLIGHTMASTER) ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_INNKEEPER)    ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_BANKER)       ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_SPIRITHEALER) ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_AUCTIONEER)   ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_REPAIR);
+
+            if (!talkable)
             {
-                // For non-quest NPCs, use gossip hello action
+                if (creature->isDead())
+                    BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                        "{} is a corpse - you do not talk to it. Loot it with loot {{\"guid\":{}}}",
+                        creature->GetName(), guid.GetCounter()));
+                else if (bot->IsValidAttackTarget(creature))
+                    BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                        "{} is a creature, not someone you can talk to. interact will never work "
+                        "on it. Kill it instead: attack {{\"guid\":{}}}",
+                        creature->GetName(), guid.GetCounter()));
+                else
+                    BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                        "{} has nothing to say and nothing to offer - leave it alone",
+                        creature->GetName()));
+                return false;
+            }
+
+            {
+                // A real NPC: talk to it, and report if the gossip still would not open.
                 bot->SetFacingToObject(creature);
                 Event event = Event("", std::to_string(guid.GetCounter()));
-                return ai->DoSpecificAction("gossip hello", event);
+                if (ai->DoSpecificAction("gossip hello", event))
+                    return true;
+
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "could not open a conversation with {} - it may be busy or have nothing for "
+                    "you right now. Try something else", creature->GetName()));
+                return false;
             }
         }
         else if (GameObject* go = ObjectAccessor::GetGameObject(*bot, guid))
@@ -310,9 +348,19 @@ namespace BotBuddyAI
                 // Use the bot's AI system to handle interaction with game objects
                 bot->SetFacingToObject(go);
                 Event event = Event("", go->GetGOInfo()->name);
-                return ai->DoSpecificAction("use", event);
+                if (ai->DoSpecificAction("use", event))
+                    return true;
+
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "{} would not open - it may be locked, empty, or need something you do not "
+                    "have. Try something else", go->GetGOInfo()->name));
+                return false;
             }
         }
+
+        BotBuddy::SetLastOutcome(bot, false,
+            "there is nothing here with that guid - it despawned, or you are too far for it to "
+            "be loaded. Pick a guid from your visible list");
         return false;
     }
 

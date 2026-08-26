@@ -11,9 +11,11 @@ class BotBuddyChatHandler : public PlayerScript
 public:
     BotBuddyChatHandler() : PlayerScript("BotBuddyChatHandler") {}
 
-    void OnPlayerChat(Player* player, uint32_t type, uint32_t lang, std::string& msg) override;
-    void OnPlayerChat(Player* player, uint32_t type, uint32_t lang, std::string& msg, Group* group) override;
-    void OnPlayerChat(Player* player, uint32_t type, uint32_t lang, std::string& msg, Channel* channel) override;
+    // This core exposes chat as OnPlayerCanUseChat (bool) rather than the older
+    // void OnPlayerChat hooks. We observe only and always allow the message through.
+    [[nodiscard]] bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg) override;
+    [[nodiscard]] bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Group* group) override;
+    [[nodiscard]] bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Channel* channel) override;
 
 private:
     void ProcessChat(Player* player, uint32_t type, uint32_t lang, std::string& msg, Channel* channel = nullptr);

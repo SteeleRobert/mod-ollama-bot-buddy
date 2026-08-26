@@ -1,4 +1,5 @@
 #include "mod-ollama-bot-buddy_api.h"
+#include "mod-ollama-bot-buddy_journal.h"
 #include "mod-ollama-bot-buddy_config.h"
 #include "mod-ollama-bot-buddy_loop.h"
 #include "Playerbots.h"
@@ -225,25 +226,24 @@ namespace BotBuddyAI
 
         if (Creature* creature = ObjectAccessor::GetCreature(*bot, guid))
         {
-            // Check interaction distance FIRST - move closer if needed
+            // Out of range: walk there, but report what actually happened rather than
+            // claiming the interaction succeeded. The model only learns to close the
+            // distance if the outcome it sees says the interaction did not happen.
             float distance = bot->GetDistance(creature);
             if (distance > INTERACTION_DISTANCE)
             {
-                // Too far - move closer first
-                if (g_EnableOllamaBotBuddyDebug) {
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} moving to interact with {} at distance {:.1f}", 
-                        bot->GetName(), creature->GetName(), distance);
-                }
-                
-                // Calculate a position close to the creature but not directly on top
                 float angle = creature->GetAngle(bot);
                 float destX = creature->GetPositionX() + cos(angle + M_PI) * 3.0f; // 3 yards away
                 float destY = creature->GetPositionY() + sin(angle + M_PI) * 3.0f;
                 float destZ = creature->GetPositionZ();
-                
+
                 bot->GetMotionMaster()->Clear();
                 bot->GetMotionMaster()->MovePoint(0, destX, destY, destZ);
-                return true; // Movement initiated, interaction will happen next cycle
+
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "too far to interact with {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                    creature->GetName(), distance, (float)INTERACTION_DISTANCE));
+                return false;
             }
             
             // Check if this is a quest giver and handle quest interaction properly
@@ -280,9 +280,12 @@ namespace BotBuddyAI
                 
                 bot->GetMotionMaster()->Clear();
                 bot->GetMotionMaster()->MovePoint(0, destX, destY, destZ);
-                return true; // Movement initiated, interaction will happen next cycle
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "too far to use {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                    go->GetGOInfo()->name, distance, interactionDist));
+                return false;
             }
-            
+
             // Check if this is a quest giver game object
             if (go->GetGoType() == GAMEOBJECT_TYPE_QUESTGIVER)
             {

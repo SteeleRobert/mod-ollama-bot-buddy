@@ -13,17 +13,20 @@
 std::unordered_map<uint64_t, std::deque<std::pair<std::string, std::string>>> botPlayerMessages;
 std::mutex botPlayerMessagesMutex;
 
-void BotBuddyChatHandler::OnPlayerChat(Player* player, uint32_t type, uint32_t lang, std::string& msg)
+bool BotBuddyChatHandler::OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg)
 {
     ProcessChat(player, type, lang, msg, nullptr);
+    return true;
 }
-void BotBuddyChatHandler::OnPlayerChat(Player* player, uint32_t type, uint32_t lang, std::string& msg, Group* /*group*/)
+bool BotBuddyChatHandler::OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Group* /*group*/)
 {
     ProcessChat(player, type, lang, msg, nullptr);
+    return true;
 }
-void BotBuddyChatHandler::OnPlayerChat(Player* player, uint32_t type, uint32_t lang, std::string& msg, Channel* channel)
+bool BotBuddyChatHandler::OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Channel* channel)
 {
     ProcessChat(player, type, lang, msg, channel);
+    return true;
 }
 
 void BotBuddyChatHandler::ProcessChat(Player* player, uint32_t type, uint32_t lang, std::string& msg, Channel* channel)

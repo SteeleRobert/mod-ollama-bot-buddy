@@ -205,29 +205,41 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
             if (params.contains("guid")) {
                 uint32_t targetGuid = params["guid"].get<uint32_t>();
                 
-                // Validate that the target exists and is attackable
+                // Validate that the target exists and is attackable. Each rejection
+                // reason is kept distinct: collapsing "it is dead", "it is out of
+                // sight" and "no such guid" into one silent false is what left the
+                // model re-attacking a corpse it had just killed.
                 bool validTarget = false;
-                
-                // Check if it's a creature
+                std::string reject;
+                Creature* found = nullptr;
+
                 for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
                 {
                     Creature* c = pair.second;
-                    if (c && c->GetGUID().GetCounter() == targetGuid)
-                    {
-                        // Validate target is attackable
-                        if (c->IsInWorld() && !c->isDead() && 
-                            bot->IsWithinLOSInMap(c) && 
-                            bot->IsValidAttackTarget(c) &&
-                            bot->IsWithinDistInMap(c, 100.0f)) // Reasonable attack range
-                        {
-                            validTarget = true;
-                        }
-                        break;
-                    }
+                    if (c && c->GetGUID().GetCounter() == targetGuid) { found = c; break; }
                 }
-                
+
+                if (found)
+                {
+                    if (found->isDead())
+                        reject = fmt::format(
+                            "{} is already dead - you killed it. Loot it with loot {{\"guid\":{}}}",
+                            found->GetName(), targetGuid);
+                    else if (!found->IsInWorld() || !bot->IsWithinDistInMap(found, 100.0f))
+                        reject = fmt::format("{} is too far away to attack - move closer first",
+                                             found->GetName());
+                    else if (!bot->IsWithinLOSInMap(found))
+                        reject = fmt::format("you cannot see {} - something is in the way",
+                                             found->GetName());
+                    else if (!bot->IsValidAttackTarget(found))
+                        reject = fmt::format("{} cannot be attacked - pick a different target",
+                                             found->GetName());
+                    else
+                        validTarget = true;
+                }
+
                 // Check if it's a player if not found as creature
-                if (!validTarget)
+                if (!validTarget && !found)
                 {
                     ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>(targetGuid);
                     Player* playerTarget = ObjectAccessor::FindConnectedPlayer(guid);
@@ -238,30 +250,18 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                     {
                         validTarget = true;
                     }
-                }
-                
-                if (!validTarget) {
-                    LOG_ERROR("server.loading", "[OllamaBotBuddy] Invalid or unreachable attack target with guid: {} - Target not found in visible creatures/players", targetGuid);
-                    
-                    // Debug: List available creature GUIDs for debugging
-                    if (g_EnableOllamaBotBuddyDebug) {
-                        std::vector<uint32> availableGuids;
-                        for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore()) {
-                            Creature* c = pair.second;
-                            if (c && bot->IsWithinDistInMap(c, 100.0f)) {
-                                availableGuids.push_back(c->GetGUID().GetCounter());
-                            }
-                        }
-                        
-                        std::ostringstream guidList;
-                        for (size_t i = 0; i < availableGuids.size() && i < 10; ++i) {
-                            if (i > 0) guidList << ", ";
-                            guidList << availableGuids[i];
-                        }
-                        
-                        LOG_DEBUG("server.loading", "[OllamaBotBuddy] Available creature GUIDs: {}", guidList.str());
+                    else
+                    {
+                        reject = fmt::format(
+                            "there is nothing here with guid {} - it despawned. "
+                            "Pick a guid from your visible list", targetGuid);
                     }
-                    
+                }
+
+                if (!validTarget) {
+                    LOG_ERROR("server.loading", "[OllamaBotBuddy] Rejected attack on guid {}: {}",
+                              targetGuid, reject);
+                    BotBuddy::SetLastOutcome(bot, false, reject);
                     return false;
                 }
                 

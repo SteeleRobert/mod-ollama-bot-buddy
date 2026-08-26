@@ -439,9 +439,14 @@ namespace BotBuddyAI
         bot->PrepareQuestMenu(guid);
         QuestMenu& questMenu = bot->PlayerTalkClass->GetQuestMenu();
 
-        bool foundQuestAction = false;
+        // Turn in what is finished, take what is offered - and keep the results,
+        // because the caller's word is what the model hears. The old code discarded
+        // both return values and reported success either way, so a failed accept
+        // looked identical to a real one and the bot re-talked to the same NPC
+        // 49 times, "succeeding" every time while its quest log stayed empty.
+        std::vector<std::string> turnedIn;
+        std::vector<std::string> accepted;
 
-        // Process all available quest menu items
         for (uint32 i = 0; i < questMenu.GetMenuItemCount(); ++i)
         {
             QuestMenuItem const& menuItem = questMenu.GetItem(i);
@@ -449,38 +454,37 @@ namespace BotBuddyAI
             if (!quest) continue;
 
             QuestStatus status = bot->GetQuestStatus(menuItem.QuestId);
-            
-            // Handle completed quests first (highest priority)
+
             if (status == QUEST_STATUS_COMPLETE && bot->CanRewardQuest(quest, false))
             {
-                // Turn in the quest using the playerbot action system
-                TurnInQuest(bot, menuItem.QuestId);
-                foundQuestAction = true;
-                
-                if (g_EnableOllamaBotBuddyDebug)
-                {
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} turning in quest {}: {}", 
-                        bot->GetName(), menuItem.QuestId, quest->GetTitle());
-                }
+                if (TurnInQuest(bot, menuItem.QuestId))
+                    turnedIn.push_back(quest->GetTitle());
             }
-            // Handle new quests that can be accepted
             else if (status == QUEST_STATUS_NONE && bot->CanTakeQuest(quest, false) && bot->CanAddQuest(quest, false))
             {
-                // Accept the quest using the playerbot action system
-                AcceptQuest(bot, menuItem.QuestId);
-                foundQuestAction = true;
-                
-                if (g_EnableOllamaBotBuddyDebug)
-                {
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} accepting quest {}: {}", 
-                        bot->GetName(), menuItem.QuestId, quest->GetTitle());
-                }
+                if (AcceptQuest(bot, menuItem.QuestId))
+                    accepted.push_back(quest->GetTitle());
             }
         }
 
-        // If we found quest actions, return success
-        if (foundQuestAction)
+        if (!turnedIn.empty() || !accepted.empty())
         {
+            auto join = [](std::vector<std::string> const& v)
+            {
+                std::string out;
+                for (size_t i = 0; i < v.size(); ++i)
+                    out += (i ? "\", \"" : "\"") + v[i];
+                return out + "\"";
+            };
+
+            std::string summary;
+            if (!turnedIn.empty())
+                summary += fmt::format("turned in {}", join(turnedIn));
+            if (!accepted.empty())
+                summary += fmt::format("{}accepted {} - check your active quests for what it needs",
+                                       turnedIn.empty() ? "" : "; ", join(accepted));
+
+            BotBuddy::SetLastOutcome(bot, true, summary);
             return true;
         }
 
@@ -493,11 +497,10 @@ namespace BotBuddyAI
                 return true;
             }
             
-            // Fallback to basic gossip hello action
-            Event event = Event("", std::to_string(guid.GetCounter()));
-            if (ai->DoSpecificAction("gossip hello", event))
-                return true;
-
+            // Nothing to hand in and nothing to take. Opening the gossip window
+            // anyway would count as a success and teach the model to keep coming
+            // back - the exact loop this path exists to break. Report why the
+            // visit achieved nothing instead.
             BotBuddy::SetLastOutcome(bot, false, NothingToDoWithQuestGiver(bot, questGiver));
             return false;
         }
@@ -545,13 +548,13 @@ namespace BotBuddyAI
             
             if (status == QUEST_STATUS_COMPLETE && bot->CanRewardQuest(quest, false))
             {
-                TurnInQuest(bot, menuItem.QuestId);
-                return true;
+                // Propagate the real result - claiming success for a failed turn-in
+                // is how the model ends up talking to the same NPC forever.
+                return TurnInQuest(bot, menuItem.QuestId);
             }
             else if (status == QUEST_STATUS_NONE && bot->CanTakeQuest(quest, false) && bot->CanAddQuest(quest, false))
             {
-                AcceptQuest(bot, menuItem.QuestId);
-                return true;
+                return AcceptQuest(bot, menuItem.QuestId);
             }
         }
 
@@ -751,19 +754,95 @@ namespace BotBuddyAI
         return ai->DoSpecificAction("stay", event);
     }
 
+    // Accept a quest directly.
+    //
+    // The playerbots "accept quest" action cannot be used here: its Execute starts
+    // with `requester = event.getOwner() ?: GetMaster()` and returns false when both
+    // are null - and an autonomous bot has neither. Every call from this harness
+    // failed on that line before doing anything, while the caller reported success.
     bool AcceptQuest(Player* bot, uint32 questId)
     {
-        if (!bot) return false;
-        
-        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (!ai) return false;
-        
-        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        if (!quest) return false;
+        if (!bot || !bot->GetMap()) return false;
 
-        // Use the playerbot AI system to handle quest acceptance
-        Event event = Event("", std::to_string(questId));
-        return ai->DoSpecificAction("accept quest", event);
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "there is no quest with id {} - use a quest id you were shown", questId));
+            return false;
+        }
+
+        QuestStatus status = bot->GetQuestStatus(questId);
+        if (status != QUEST_STATUS_NONE)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you already have \"{}\" in your log - no need to accept it again",
+                quest->GetTitle()));
+            return false;
+        }
+
+        // The quest giver must actually be here and close enough.
+        Object* giver = nullptr;
+        std::string giverName;
+        float giverDist = 0.f;
+        for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+        {
+            Creature* c = pair.second;
+            if (!c || !c->IsAlive() || !c->hasQuest(questId)) continue;
+            float d = bot->GetDistance(c);
+            if (!giver || d < giverDist) { giver = c; giverName = c->GetName(); giverDist = d; }
+        }
+        if (!giver)
+        {
+            for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
+            {
+                GameObject* go = pair.second;
+                if (!go || !go->hasQuest(questId)) continue;
+                float d = bot->GetDistance(go);
+                if (!giver || d < giverDist) { giver = go; giverName = go->GetName(); giverDist = d; }
+            }
+        }
+
+        if (!giver)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "nobody around here offers \"{}\" - find the right quest giver first",
+                quest->GetTitle()));
+            return false;
+        }
+        if (giverDist > INTERACTION_DISTANCE)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far from {} to take \"{}\" ({:.1f}y away, need {:.1f}y) - move to them first",
+                giverName, quest->GetTitle(), giverDist, (float)INTERACTION_DISTANCE));
+            return false;
+        }
+
+        if (!bot->CanAddQuest(quest, false))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "cannot take \"{}\" - your quest log is full. Finish or abandon something first",
+                quest->GetTitle()));
+            return false;
+        }
+        if (!bot->CanTakeQuest(quest, false))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you do not qualify for \"{}\" right now", quest->GetTitle()));
+            return false;
+        }
+
+        bot->AddQuestAndCheckCompletion(quest, giver);
+
+        BotBuddy::SetLastOutcome(bot, true, fmt::format(
+            "accepted \"{}\" from {} - check your active quests for what it needs",
+            quest->GetTitle(), giverName));
+
+        if (g_EnableOllamaBotBuddyDebug)
+            LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} accepted quest {}: {}",
+                bot->GetName(), questId, quest->GetTitle());
+
+        return true;
     }
 
     bool TurnInQuest(Player* bot, uint32 questId)
@@ -777,23 +856,26 @@ namespace BotBuddyAI
         if (!quest) return false;
 
         // Check if quest is ready to turn in
-        if (bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE || bot->GetQuestRewardStatus(questId))
+        if (bot->GetQuestRewardStatus(questId))
         {
-            if (g_EnableOllamaBotBuddyDebug)
-            {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} cannot turn in quest {}: status={}, already rewarded={}", 
-                    bot->GetName(), questId, bot->GetQuestStatus(questId), bot->GetQuestRewardStatus(questId));
-            }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you already turned \"{}\" in - it is done. Do something else",
+                quest->GetTitle()));
+            return false;
+        }
+        if (bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "\"{}\" is not finished yet - complete its objectives before turning it in",
+                quest->GetTitle()));
             return false;
         }
         
         if (!bot->CanRewardQuest(quest, false))
         {
-            if (g_EnableOllamaBotBuddyDebug)
-            {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} cannot reward quest {}: requirements not met", 
-                    bot->GetName(), questId);
-            }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "cannot turn \"{}\" in yet - a requirement is still missing (an item to hand "
+                "over, or bag space for the reward)", quest->GetTitle()));
             return false;
         }
         
@@ -829,11 +911,9 @@ namespace BotBuddyAI
         
         if (!questGiverGuid)
         {
-            if (g_EnableOllamaBotBuddyDebug)
-            {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} cannot find quest giver for quest {}", 
-                    bot->GetName(), questId);
-            }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "nobody close enough takes \"{}\" - walk to the NPC the quest says to return "
+                "to, then turn it in", quest->GetTitle()));
             return false;
         }
         
@@ -868,6 +948,14 @@ namespace BotBuddyAI
         rewardPacket.rpos(0);
         bot->GetSession()->HandleQuestgiverChooseRewardOpcode(rewardPacket);
         
+        std::string rewardNote;
+        if (quest->GetRewChoiceItemsCount() > 0 && quest->RewardChoiceItemId[rewardIndex])
+            if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(quest->RewardChoiceItemId[rewardIndex]))
+                rewardNote = fmt::format(", taking {} as the reward", proto->Name1);
+
+        BotBuddy::SetLastOutcome(bot, true, fmt::format(
+            "turned in \"{}\"{}", quest->GetTitle(), rewardNote));
+
         if (g_EnableOllamaBotBuddyDebug)
         {
             LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} turned in quest {}: {} with reward index {}", 

@@ -284,7 +284,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 return false;
             }
         }
-        else if (type == "spell")
+        else if (type == "cast" || type == "spell")
         {
             if (params.contains("spellid")) {
                 command.type = BotControlCommandType::CastSpell;
@@ -293,6 +293,7 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                     command.args.push_back(std::to_string(params["guid"].get<uint32_t>()));
             } else {
                 LOG_ERROR("server.loading", "[OllamaBotBuddy] spell missing spellid");
+                BotBuddy::SetLastOutcome(bot, false, "cast needs a \"spellid\" from your known spells list");
                 return false;
             }
         }
@@ -441,29 +442,45 @@ std::string GetBotSpellInfo(Player* bot)
         if (spellInfo->SpellFamilyName == SPELLFAMILY_GENERIC)
             continue;
 
-        if (bot->HasSpellCooldown(spellId))
-            continue;
+        // A spell on cooldown is annotated, not hidden - a vanished spell and a
+        // spell that is recharging call for different decisions.
+        bool onCooldown = bot->HasSpellCooldown(spellId);
 
         std::string effectText;
+        bool buildsCombo = false;
         for (int i = 0; i < MAX_SPELL_EFFECTS; ++i)
         {
             if (!spellInfo->Effects[i].IsEffect())
                 continue;
+            if (spellInfo->Effects[i].Effect == SPELL_EFFECT_ADD_COMBO_POINTS)
+                buildsCombo = true;
 
+            if (!effectText.empty())
+                continue;
             switch (spellInfo->Effects[i].Effect)
             {
                 case SPELL_EFFECT_SCHOOL_DAMAGE: effectText = "Deals damage"; break;
+                // Melee strikes are most of what a martial class has; the old switch
+                // dropped them all, which is why the rogue's prompt listed Eviscerate
+                // but not the Sinister Strike needed to fuel it.
+                case SPELL_EFFECT_WEAPON_DAMAGE:
+                case SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
+                case SPELL_EFFECT_NORMALIZED_WEAPON_DMG: effectText = "Weapon strike, deals damage"; break;
                 case SPELL_EFFECT_HEAL: effectText = "Heals the target"; break;
                 case SPELL_EFFECT_APPLY_AURA: effectText = "Applies an aura"; break;
                 case SPELL_EFFECT_DISPEL: effectText = "Dispels magic"; break;
                 case SPELL_EFFECT_THREAT: effectText = "Generates threat"; break;
-                default: continue;
+                default: break;
             }
-            break;
         }
 
         if (effectText.empty())
             continue;
+
+        if (buildsCombo)
+            effectText += ", builds a combo point";
+        if (spellInfo->NeedsComboPoints())
+            effectText += ", spends ALL your combo points (use with 3+)";
 
         const char* name = spellInfo->SpellName[0];
         if (!name || !*name)
@@ -487,7 +504,8 @@ std::string GetBotSpellInfo(Player* bot)
             costText = "no cost";
         }
         
-        spellSummary << "**" << name << "** (ID: " << spellId << ") - " << effectText << ", Costs " << costText << ".\n";
+        spellSummary << "**" << name << "** (ID: " << spellId << ") - " << effectText << ", Costs " << costText
+                     << (onCooldown ? ". ON COOLDOWN - not ready yet" : "") << ".\n";
 
     }
 
@@ -1061,6 +1079,10 @@ std::string GetCombatSummary(Player* bot)
         oss << "Your HP: " << (bot ? std::to_string(bot->GetHealth()) : "?") << "/" << (bot ? std::to_string(bot->GetMaxHealth()) : "?");
         oss << ", Mana: " << (bot ? std::to_string(bot->GetPower(POWER_MANA)) : "?") << "/" << (bot ? std::to_string(bot->GetMaxPower(POWER_MANA)) : "?");
         oss << ", Energy: " << (bot ? std::to_string(bot->GetPower(POWER_ENERGY)) : "?") << "/" << (bot ? std::to_string(bot->GetMaxPower(POWER_ENERGY)) : "?");
+        // Combo points only mean something to classes that have them, and only on
+        // the current target - but a finisher decision is impossible without them.
+        if (bot && (bot->getClass() == CLASS_ROGUE || bot->getClass() == CLASS_DRUID) && bot->GetComboPoints())
+            oss << ", Combo Points on your target: " << uint32(bot->GetComboPoints());
     }
     else
     {
@@ -1077,6 +1099,10 @@ std::string GetCombatSummary(Player* bot)
         oss << "Your HP: " << (bot ? std::to_string(bot->GetHealth()) : "?") << "/" << (bot ? std::to_string(bot->GetMaxHealth()) : "?");
         oss << ", Mana: " << (bot ? std::to_string(bot->GetPower(POWER_MANA)) : "?") << "/" << (bot ? std::to_string(bot->GetMaxPower(POWER_MANA)) : "?");
         oss << ", Energy: " << (bot ? std::to_string(bot->GetPower(POWER_ENERGY)) : "?") << "/" << (bot ? std::to_string(bot->GetMaxPower(POWER_ENERGY)) : "?");
+        // Combo points only mean something to classes that have them, and only on
+        // the current target - but a finisher decision is impossible without them.
+        if (bot && (bot->getClass() == CLASS_ROGUE || bot->getClass() == CLASS_DRUID) && bot->GetComboPoints())
+            oss << ", Combo Points on your target: " << uint32(bot->GetComboPoints());
     }
     return oss.str();
 }
@@ -1313,6 +1339,18 @@ static std::string QueryOllamaLLM(const std::string& prompt)
             guidCmd("attack"),
             guidCmd("interact"),
             guidCmd("move_to_target"),
+            // cast: spellid required, guid optional (omitted = cast on yourself)
+            {
+                {"type", "object"},
+                {"properties", {
+                    {"type",   {{"const", "cast"}}},
+                    {"params", {{"type", "object"},
+                                {"properties", {{"spellid", {{"type", "integer"}}},
+                                                {"guid",    {{"type", "integer"}}}}},
+                                {"required", {"spellid"}}}}
+                }},
+                {"required", {"type", "params"}}
+            },
             // loot names the corpse it is looting, so a failure can be attributed
             // to a specific target rather than to "looting" in the abstract.
             {
@@ -1546,15 +1584,17 @@ How to choose:
 - You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
 - Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
 - Anything marked [IN RANGE - ...] is close enough already, and the mark says which command to use on it. Use that command this turn; do not move to it again.
+- In a fight, use your abilities with cast - attack alone only swings your weapon, and your energy or mana is wasted sitting at full. Spend combo points with your finisher once you have built a few.
 - interact is only for NPCs and objects you can talk to or use. Beasts and monsters are not; you attack those.
 - Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
 
 Reply with a single JSON object and nothing else, in exactly this shape:
-{"command":{"type":"<one of: move_to_target, move_to, attack, interact, loot, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
+{"command":{"type":"<one of: move_to_target, move_to, attack, cast, interact, loot, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
 
 params by command type:
   move_to      {"x":<float>,"y":<float>,"z":<float>}
   attack       {"guid":<guid from your visible list>}
+  cast         {"spellid":<ID from your known spells>,"guid":<target guid; omit to cast on yourself>}
   interact     {"guid":<guid from your visible list>}
   loot         {"guid":<guid of a corpse marked DEAD (LOOTABLE)>}
   accept_quest {"id":<quest id>}

@@ -724,65 +724,122 @@ namespace BotBuddyAI
         return false;
     }
 
+    // Cast an ability directly through the core.
+    //
+    // The old version delegated to playerbots actions by spell name - the same
+    // pattern that made loot and quest accept structurally dead under
+    // ClearStrategies(). Casting through Unit::CastSpell returns a SpellCastResult,
+    // so every refusal the game engine has can be translated into an outcome the
+    // model can act on.
     bool CastSpell(Player* bot, uint32 spellId, Unit* target)
     {
         if (!bot) return false;
-        
-        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (!ai) return false;
-        
+
         SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
-        if (!spellInfo) return false;
-        
-        // Set the target in the AI context if provided
-        if (target) {
-            ai->GetAiObjectContext()->GetValue<Unit*>("current target")->Set(target);
-            
-            // Check range requirements for the spell
-            float spellRange = spellInfo->GetMaxRange(false);
-            float currentDistance = bot->GetDistance(target);
-            bool isMeleeSpell = spellRange <= ATTACK_DISTANCE;
-            
-            if (g_EnableOllamaBotBuddyDebug) {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Casting spell {} on target at distance {:.1f}, spell range: {:.1f}", 
-                    spellInfo->SpellName[0], currentDistance, spellRange);
+        if (!spellInfo)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "no spell with id {} exists - use an ID from your known spells list", spellId));
+            return false;
+        }
+        std::string name = (spellInfo->SpellName[0] && *spellInfo->SpellName[0])
+            ? spellInfo->SpellName[0] : fmt::format("spell {}", spellId);
+
+        if (!bot->HasSpell(spellId))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you do not know {} - only use IDs from your known spells list", name));
+            return false;
+        }
+        if (bot->HasSpellCooldown(spellId))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is still on cooldown - do something else while it recovers", name));
+            return false;
+        }
+
+        if (!target) target = bot;
+
+        if (target != bot)
+        {
+            // Close the distance first if the ability cannot reach.
+            float maxRange = spellInfo->GetMaxRange(false, bot);
+            if (maxRange <= 0.f) maxRange = 5.0f; // melee ability
+            float dist = bot->GetDistance(target);
+            if (dist > maxRange)
+            {
+                bot->GetMotionMaster()->Clear();
+                bot->GetMotionMaster()->MoveChase(target->ToUnit(), 0.0f);
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "too far to hit {} with {} ({:.1f}y away, reaches {:.1f}y) - walking closer, retry when adjacent",
+                    target->GetName(), name, dist, maxRange));
+                return false;
             }
-            
-            // Handle positioning for spell casting
-            Event moveEvent = Event("", "");
-            if (isMeleeSpell && !bot->IsWithinMeleeRange(target)) {
-                // Need to get into melee range for melee spells
-                ai->DoSpecificAction("reach melee", moveEvent);
-            } else if (!isMeleeSpell && currentDistance > spellRange) {
-                // Need to get into spell range for ranged spells
-                ai->DoSpecificAction("reach spell", moveEvent);
-            } else if (!isMeleeSpell && currentDistance < 5.0f && ai->IsRanged(bot)) {
-                // Ranged character too close - back away for better positioning
-                ai->DoSpecificAction("flee", moveEvent);
+            bot->SetFacingToObject(target);
+        }
+
+        SpellCastResult res = bot->CastSpell(target, spellId, false);
+        if (res == SPELL_CAST_OK)
+        {
+            BotBuddy::SetLastOutcome(bot, true, target == bot
+                ? fmt::format("cast {}", name)
+                : fmt::format("hit {} with {}", target->GetName(), name));
+            if (g_EnableOllamaBotBuddyDebug)
+                LOG_INFO("server.loading", "[OllamaBotBuddy] {} cast {} on {}",
+                    bot->GetName(), name, target->GetName());
+            return true;
+        }
+
+        std::string why;
+        switch (res)
+        {
+            case SPELL_FAILED_NO_COMBO_POINTS:
+                why = fmt::format("{} spends combo points and you have none on this target - "
+                                  "build them first with your combo-generating strike", name);
+                break;
+            case SPELL_FAILED_NO_POWER:
+            {
+                char const* power = "energy";
+                switch (spellInfo->PowerType)
+                {
+                    case POWER_MANA: power = "mana"; break;
+                    case POWER_RAGE: power = "rage"; break;
+                    case POWER_ENERGY: power = "energy"; break;
+                    default: break;
+                }
+                why = fmt::format("not enough {} for {} right now - keep attacking and try again shortly",
+                                  power, name);
+                break;
             }
+            case SPELL_FAILED_OUT_OF_RANGE:
+                why = fmt::format("{} is out of range of {} - move closer", target->GetName(), name);
+                break;
+            case SPELL_FAILED_LINE_OF_SIGHT:
+                why = fmt::format("you cannot see {} from here - something is in the way", target->GetName());
+                break;
+            case SPELL_FAILED_NOT_READY:
+                why = fmt::format("{} is not ready yet - do something else this turn", name);
+                break;
+            case SPELL_FAILED_NOT_BEHIND:
+                why = fmt::format("{} only works from behind the target - move behind it first", name);
+                break;
+            case SPELL_FAILED_BAD_TARGETS:
+            case SPELL_FAILED_TARGET_FRIENDLY:
+            case SPELL_FAILED_TARGETS_DEAD:
+                why = fmt::format("{} cannot be used on {} - pick a valid target for it",
+                                  name, target->GetName());
+                break;
+            case SPELL_FAILED_CASTER_AURASTATE:
+            case SPELL_FAILED_ONLY_STEALTHED:
+                why = fmt::format("{} cannot be used in your current state (it may require stealth "
+                                  "or another condition you do not meet)", name);
+                break;
+            default:
+                why = fmt::format("could not cast {} (engine refusal code {})", name, int(res));
+                break;
         }
-        
-        // Use the spell name directly as the action
-        const char* spellName = spellInfo->SpellName[0];
-        if (!spellName || !*spellName) return false;
-        
-        Event event = Event("", "");
-        bool result = ai->DoSpecificAction(spellName, event);
-        
-        // If spell casting by name fails, try using spell ID
-        if (!result && target) {
-            // Try alternative approaches
-            std::string spellIdStr = std::to_string(spellId);
-            event = Event("", spellIdStr);
-            result = ai->DoSpecificAction("cast", event);
-        }
-        
-        if (g_EnableOllamaBotBuddyDebug) {
-            LOG_INFO("server.loading", "[OllamaBotBuddy] Spell cast result for {}: {}", 
-                spellName, result ? "SUCCESS" : "FAILED");
-        }
-        
-        return result;
+        BotBuddy::SetLastOutcome(bot, false, why);
+        return false;
     }
 
     bool Say(Player* bot, const std::string& msg)
@@ -1420,6 +1477,13 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                         ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>(lowGuid);
                         Player* playerTarget = ObjectAccessor::FindConnectedPlayer(guid);
                         if (playerTarget) target = playerTarget;
+                    }
+                    if (!target)
+                    {
+                        BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                            "nothing here has guid {} - it despawned. Pick a target from your visible list",
+                            lowGuid));
+                        return false;
                     }
                 }
                 else

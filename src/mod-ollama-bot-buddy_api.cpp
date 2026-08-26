@@ -513,6 +513,7 @@ namespace BotBuddyAI
         // 49 times, "succeeding" every time while its quest log stayed empty.
         std::vector<std::string> turnedIn;
         std::vector<std::string> accepted;
+        std::vector<std::string> healed;
 
         for (uint32 i = 0; i < questMenu.GetMenuItemCount(); ++i)
         {
@@ -532,9 +533,23 @@ namespace BotBuddyAI
                 if (AcceptQuest(bot, menuItem.QuestId))
                     accepted.push_back(quest->GetTitle());
             }
+            else if (status == QUEST_STATUS_INCOMPLETE)
+            {
+                // Replace a lost delivery item while we are standing at the one NPC
+                // who could hand it out (see AcceptQuest for how it goes missing).
+                uint32 srcItem = quest->GetSrcItemId();
+                if (srcItem &&
+                    !bot->HasItemCount(srcItem, std::max<uint32>(1, quest->GetSrcItemCount())) &&
+                    bot->GiveQuestSourceItem(quest))
+                {
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(srcItem);
+                    healed.push_back(fmt::format("{} for \"{}\"",
+                        proto ? proto->Name1 : "the quest item", quest->GetTitle()));
+                }
+            }
         }
 
-        if (!turnedIn.empty() || !accepted.empty())
+        if (!turnedIn.empty() || !accepted.empty() || !healed.empty())
         {
             auto join = [](std::vector<std::string> const& v)
             {
@@ -550,6 +565,9 @@ namespace BotBuddyAI
             if (!accepted.empty())
                 summary += fmt::format("{}accepted {} - check your active quests for what it needs",
                                        turnedIn.empty() ? "" : "; ", join(accepted));
+            for (auto const& h : healed)
+                summary += fmt::format("{}your missing {} has been replaced - deliver it as the quest says",
+                                       summary.empty() ? "" : "; ", h);
 
             BotBuddy::SetLastOutcome(bot, true, summary);
             return true;
@@ -899,6 +917,24 @@ namespace BotBuddyAI
         QuestStatus status = bot->GetQuestStatus(questId);
         if (status != QUEST_STATUS_NONE)
         {
+            // Self-heal a lost delivery item. A crash between saves can leave the
+            // quest in the log with its source item gone - unfinishable, since the
+            // item only exists at accept time and the bot has no abandon verb. If
+            // the giver is willing to hand the quest out, it can hand the parcel
+            // out again too.
+            uint32 srcItem = quest->GetSrcItemId();
+            if (srcItem && status == QUEST_STATUS_INCOMPLETE &&
+                !bot->HasItemCount(srcItem, std::max<uint32>(1, quest->GetSrcItemCount())) &&
+                bot->GiveQuestSourceItem(quest))
+            {
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(srcItem);
+                BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                    "you already have \"{}\" - and your missing {} has been replaced. "
+                    "Deliver it as the quest says",
+                    quest->GetTitle(), proto ? proto->Name1 : "quest item"));
+                return true;
+            }
+
             BotBuddy::SetLastOutcome(bot, false, fmt::format(
                 "you already have \"{}\" in your log - no need to accept it again",
                 quest->GetTitle()));

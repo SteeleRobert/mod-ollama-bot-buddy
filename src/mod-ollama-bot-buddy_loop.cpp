@@ -1185,6 +1185,10 @@ std::string GetDetailedQuestInfo(Player* bot)
                             oss << " COMPLETE";
                         } else {
                             oss << " NEED " << (requiredCount - currentCount) << " MORE";
+                            // Say where, not just what - an objective with no location
+                            // gets its location invented from pretraining.
+                            if (quest->RequiredNpcOrGo[i] > 0)
+                                oss << " " << BotBuddyAI::QuestKillTargetHint(bot, uint32(quest->RequiredNpcOrGo[i]));
                         }
                         oss << "\n";
                     }
@@ -1206,6 +1210,9 @@ std::string GetDetailedQuestInfo(Player* bot)
                             oss << " COMPLETE";
                         } else {
                             oss << " NEED " << (requiredCount - currentCount) << " MORE";
+                            std::string where = BotBuddyAI::QuestItemSourceHint(bot, quest->RequiredItemId[i]);
+                            if (!where.empty())
+                                oss << " - " << where;
                         }
                         oss << "\n";
                     }

@@ -19,6 +19,7 @@
 #include "WorldSession.h"
 #include "GossipDef.h"
 #include "LootMgr.h"
+#include "DatabaseEnv.h"
 #include <sstream>
 
 // Constants for interaction and combat ranges
@@ -364,6 +365,112 @@ namespace BotBuddyAI
         return false;
     }
 
+    namespace
+    {
+        Creature* NearestCreatureOfEntry(Player* bot, uint32 entry)
+        {
+            Creature* nearest = nullptr;
+            float best = 0.f;
+            if (!bot->GetMap()) return nullptr;
+            for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+            {
+                Creature* c = pair.second;
+                if (!c || c->GetEntry() != entry || !c->IsAlive()) continue;
+                float d = bot->GetDistance(c);
+                if (!nearest || d < best) { nearest = c; best = d; }
+            }
+            return nearest;
+        }
+
+        GameObject* NearestGameObjectOfEntry(Player* bot, uint32 entry)
+        {
+            GameObject* nearest = nullptr;
+            float best = 0.f;
+            if (!bot->GetMap()) return nullptr;
+            for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
+            {
+                GameObject* go = pair.second;
+                if (!go || go->GetEntry() != entry) continue;
+                float d = bot->GetDistance(go);
+                if (!nearest || d < best) { nearest = go; best = d; }
+            }
+            return nearest;
+        }
+
+        struct ItemSources
+        {
+            std::vector<std::pair<uint32, std::string>> creatures; // entry, name
+            std::vector<std::pair<uint32, std::string>> objects;   // entry, name
+        };
+    }
+
+    // Where a quest item actually comes from on this server. The model's
+    // pretraining "knows" WoW well enough to invent an answer - it decided the
+    // journal was inside a wolf and asked an innkeeper's assistant for it - so
+    // the real answer has to be stated, not left to be guessed. Sources resolve
+    // from the world database once per item and are cached for the server's life.
+    std::string QuestItemSourceHint(Player* bot, uint32 itemId)
+    {
+        static std::mutex cacheMutex;
+        static std::unordered_map<uint32, ItemSources> cache;
+
+        ItemSources const* src = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            auto it = cache.find(itemId);
+            if (it == cache.end())
+            {
+                ItemSources fresh;
+                if (QueryResult r = WorldDatabase.Query(
+                        "SELECT ct.entry, ct.name FROM creature_template ct "
+                        "JOIN creature_loot_template clt ON clt.entry = ct.lootid "
+                        "WHERE clt.item = {} LIMIT 4", itemId))
+                    do { Field* f = r->Fetch(); fresh.creatures.push_back({f[0].Get<uint32>(), f[1].Get<std::string>()}); } while (r->NextRow());
+                if (QueryResult r = WorldDatabase.Query(
+                        "SELECT gt.entry, gt.name FROM gameobject_template gt "
+                        "JOIN gameobject_loot_template glt ON glt.entry = gt.Data1 "
+                        "WHERE gt.type = 3 AND glt.item = {} LIMIT 4", itemId))
+                    do { Field* f = r->Fetch(); fresh.objects.push_back({f[0].Get<uint32>(), f[1].Get<std::string>()}); } while (r->NextRow());
+                it = cache.emplace(itemId, std::move(fresh)).first;
+            }
+            src = &it->second;
+        }
+
+        for (auto const& [entry, name] : src->creatures)
+        {
+            if (Creature* c = NearestCreatureOfEntry(bot, entry))
+                return fmt::format(
+                    "drops from {} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f}) - kill it, then loot it",
+                    name, c->GetGUID().GetCounter(),
+                    c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), bot->GetDistance(c));
+        }
+        for (auto const& [entry, name] : src->objects)
+        {
+            if (GameObject* go = NearestGameObjectOfEntry(bot, entry))
+                return fmt::format(
+                    "found inside {} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f}) - go there and interact with it",
+                    name, go->GetGUID().GetCounter(),
+                    go->GetPositionX(), go->GetPositionY(), go->GetPositionZ(), bot->GetDistance(go));
+        }
+        if (!src->creatures.empty())
+            return fmt::format("drops from {} - none are near you, travel to find them",
+                               src->creatures.front().second);
+        if (!src->objects.empty())
+            return fmt::format("found inside {} - none are near you, travel to find it",
+                               src->objects.front().second);
+        return "";
+    }
+
+    // Nearest live spawn of a kill objective, so "Kill X: 0/8" comes with a place.
+    std::string QuestKillTargetHint(Player* bot, uint32 creatureEntry)
+    {
+        if (Creature* c = NearestCreatureOfEntry(bot, creatureEntry))
+            return fmt::format("(nearest one: guid {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f})",
+                c->GetGUID().GetCounter(),
+                c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), bot->GetDistance(c));
+        return "(none near you right now - travel to find them)";
+    }
+
     // Who takes this quest when it is done, and where they are right now. The
     // quest log tells the bot a quest is READY TO TURN IN but not to whom - and a
     // model with no name to anchor on invents one from its pretraining ("move
@@ -383,24 +490,12 @@ namespace BotBuddyAI
             std::string name = tmpl ? tmpl->Name : "an NPC";
 
             // Find the closest live spawn so the model gets a place, not just a name.
-            Creature* nearest = nullptr;
-            float best = 0.f;
-            if (bot->GetMap())
-            {
-                for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
-                {
-                    Creature* c = pair.second;
-                    if (!c || c->GetEntry() != enderEntry || !c->IsAlive()) continue;
-                    float d = bot->GetDistance(c);
-                    if (!nearest || d < best) { nearest = c; best = d; }
-                }
-            }
-            if (nearest)
+            if (Creature* nearest = NearestCreatureOfEntry(bot, enderEntry))
                 return fmt::format(
                     "{} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f})",
                     name, nearest->GetGUID().GetCounter(),
                     nearest->GetPositionX(), nearest->GetPositionY(), nearest->GetPositionZ(),
-                    best);
+                    bot->GetDistance(nearest));
             return name + " (not in this area - travel to find them)";
         }
 

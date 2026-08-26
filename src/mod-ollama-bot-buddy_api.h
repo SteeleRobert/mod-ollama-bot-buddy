@@ -46,6 +46,11 @@ namespace BotBuddyAI
     /// "Talin Keeneye (guid: N, Position: x y z, Distance: d)" for the NPC that
     /// takes questId when finished; empty if none is known.
     std::string QuestEnderHint(Player* bot, uint32 questId);
+    /// Where a quest item comes from on this server - "drops from X (guid, position,
+    /// distance)" / "found inside Y ..." - resolved from loot tables, cached per item.
+    std::string QuestItemSourceHint(Player* bot, uint32 itemId);
+    /// Nearest live spawn of a kill-objective creature, as a place the model can use.
+    std::string QuestKillTargetHint(Player* bot, uint32 creatureEntry);
     bool AutoNavigateGossipForQuests(Player* bot, Creature* creature);
     bool HasQuestsAvailable(Player* bot, WorldObject* questGiver);
     /// Loot a corpse. lowGuid is the guid the model saw in its visible list;

@@ -1116,37 +1116,17 @@ std::string GetDetailedQuestInfo(Player* bot)
         oss << "Level: " << quest->GetQuestLevel() << " | XP Reward: " << quest->XPValue(bot->GetLevel()) << "\n";
         
         if (status == QUEST_STATUS_COMPLETE) {
-            oss << "*** PRIORITY: FIND QUEST GIVER TO TURN IN THIS QUEST ***\n";
-            
-            // Find who can accept this quest turn-in
-            std::vector<std::string> turnInNPCs;
-            
-            // Check creatures that can accept this quest
-            QuestRelationBounds qir = sObjectMgr->GetCreatureQuestInvolvedRelationBounds(questId);
-            for (QuestRelations::const_iterator itr = qir.first; itr != qir.second; ++itr) {
-                CreatureTemplate const* cTemplate = sObjectMgr->GetCreatureTemplate(itr->first);
-                if (cTemplate) {
-                    turnInNPCs.push_back(std::string("NPC: ") + cTemplate->Name);
-                }
-            }
-            
-            // Check game objects that can accept this quest
-            QuestRelationBounds goQir = sObjectMgr->GetGOQuestInvolvedRelationBounds(questId);
-            for (QuestRelations::const_iterator itr = goQir.first; itr != goQir.second; ++itr) {
-                GameObjectTemplate const* goTemplate = sObjectMgr->GetGameObjectTemplate(itr->first);
-                if (goTemplate) {
-                    turnInNPCs.push_back(std::string("Object: ") + goTemplate->name);
-                }
-            }
-            
-            if (!turnInNPCs.empty()) {
-                oss << "Turn in to: ";
-                for (size_t i = 0; i < turnInNPCs.size(); ++i) {
-                    oss << turnInNPCs[i];
-                    if (i < turnInNPCs.size() - 1) oss << " OR ";
-                }
-                oss << "\n";
-            }
+            // Say WHO takes the quest and WHERE they are. The old banner shouted
+            // "FIND QUEST GIVER TO TURN IN" with no name attached (its lookup passed
+            // a quest id where a creature entry belongs, so the name never resolved),
+            // and the model turned that into 11 straight interacts with whichever
+            // quest giver happened to be standing closest.
+            std::string ender = BotBuddyAI::QuestEnderHint(bot, questId);
+            if (!ender.empty())
+                oss << "DONE. Hand it in to " << ender
+                    << " - use move_to_target with that guid to walk there, then interact.\n";
+            else
+                oss << "DONE. Hand it in to the NPC the quest text says to return to.\n";
         } else {
             // Quest is incomplete - show objectives
             oss << "Objectives to complete:\n";

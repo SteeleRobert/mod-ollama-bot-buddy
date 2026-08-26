@@ -364,12 +364,79 @@ namespace BotBuddyAI
         return false;
     }
 
+    // Who takes this quest when it is done, and where they are right now. The
+    // quest log tells the bot a quest is READY TO TURN IN but not to whom - and a
+    // model with no name to anchor on invents one from its pretraining ("move
+    // toward the quest giver Farmer Saldean", in Coldridge Valley). Hand it the
+    // real ender, with a guid and coordinates it can put straight into
+    // move_to_target.
+    std::string QuestEnderHint(Player* bot, uint32 questId)
+    {
+        // No reverse index exists for quest -> ender, so walk the forward map.
+        uint32 enderEntry = 0;
+        for (auto const& rel : *sObjectMgr->GetCreatureQuestInvolvedRelationMap())
+            if (rel.second == questId) { enderEntry = rel.first; break; }
+
+        if (enderEntry)
+        {
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(enderEntry);
+            std::string name = tmpl ? tmpl->Name : "an NPC";
+
+            // Find the closest live spawn so the model gets a place, not just a name.
+            Creature* nearest = nullptr;
+            float best = 0.f;
+            if (bot->GetMap())
+            {
+                for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                {
+                    Creature* c = pair.second;
+                    if (!c || c->GetEntry() != enderEntry || !c->IsAlive()) continue;
+                    float d = bot->GetDistance(c);
+                    if (!nearest || d < best) { nearest = c; best = d; }
+                }
+            }
+            if (nearest)
+                return fmt::format(
+                    "{} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f})",
+                    name, nearest->GetGUID().GetCounter(),
+                    nearest->GetPositionX(), nearest->GetPositionY(), nearest->GetPositionZ(),
+                    best);
+            return name + " (not in this area - travel to find them)";
+        }
+
+        for (auto const& rel : *sObjectMgr->GetGOQuestInvolvedRelationMap())
+            if (rel.second == questId)
+            {
+                GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(rel.first);
+                return tmpl ? tmpl->name : "an object";
+            }
+
+        return "";
+    }
+
     // A quest giver whose quest you already hold, and have not finished, offers
     // nothing when you talk to it. Returning a bare false there sends the model
     // straight back to the same NPC - it talked to Sten Stoutarm 45 times in a row.
     // Name the quest and the objective that is short.
     std::string NothingToDoWithQuestGiver(Player* bot, WorldObject* questGiver)
     {
+        // A quest that is done but not handed in is the loudest signal here: the
+        // model is usually at the wrong NPC trying to turn it in. Say who takes it.
+        for (auto const& qs : bot->getQuestStatusMap())
+        {
+            if (qs.second.Status != QUEST_STATUS_COMPLETE || bot->GetQuestRewardStatus(qs.first)) continue;
+
+            Quest const* quest = sObjectMgr->GetQuestTemplate(qs.first);
+            if (!quest) continue;
+
+            std::string ender = QuestEnderHint(bot, qs.first);
+            if (!ender.empty())
+                return fmt::format(
+                    "{} does not take \"{}\" - hand it in to {} instead. Use move_to_target "
+                    "with that guid to walk there, then interact",
+                    questGiver->GetName(), quest->GetTitle(), ender);
+        }
+
         for (auto const& qs : bot->getQuestStatusMap())
         {
             if (qs.second.Status != QUEST_STATUS_INCOMPLETE) continue;

@@ -43,6 +43,9 @@ namespace BotBuddyAI
     bool AcceptQuest(Player* bot, uint32 questId);
     bool TurnInQuest(Player* bot, uint32 questId);
     bool InteractWithQuestGiver(Player* bot, WorldObject* questGiver);
+    /// "Talin Keeneye (guid: N, Position: x y z, Distance: d)" for the NPC that
+    /// takes questId when finished; empty if none is known.
+    std::string QuestEnderHint(Player* bot, uint32 questId);
     bool AutoNavigateGossipForQuests(Player* bot, Creature* creature);
     bool HasQuestsAvailable(Player* bot, WorldObject* questGiver);
     /// Loot a corpse. lowGuid is the guid the model saw in its visible list;

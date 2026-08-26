@@ -1532,15 +1532,10 @@ static std::string BuildBotPrompt(Player* bot)
     }
 
     if (!losLocs.empty() || !wps.empty()) {
-        oss << "You must select one of these locations or waypoints to move to, interact with, accept or turn in quests, attack, loot, or any other action or choose a new unexplored spot.\n";
-        oss << "COORDINATE CALCULATION RULES:\n";
-        oss << " - YOUR POSITION: Use your current Position coordinates as reference point for all calculations\n";
-        oss << " - TO MOVE TO TARGETS: Use their exact 'Position: X Y Z' coordinates OR calculate closer positions\n";
-        oss << " - TO MOVE CLOSER: Calculate coordinates 70% of the way between your position and target\n";
-        oss << " - TO EXPLORE: Use waypoint coordinates from navigation list OR calculate new exploration points\n";
-        oss << " - DISTANCE THRESHOLDS: <5.0=attack/interact directly, >15.0=move closer using calculated coordinates\n";
-        oss << " - COORDINATE MATH: You can add/subtract 5-20 units from any position to create tactical positioning\n";
-        oss << "IMPORTANT: You can ONLY attack creatures/NPCs that are listed above in the visible locations. If your quest requires creatures that are NOT visible, you must move to find them using waypoints or exploration.\n";
+        oss << "Getting around:\n";
+        oss << " - To go to something you can see, use move_to_target with its guid and the pathing will route you there. Do not work out coordinates yourself.\n";
+        oss << " - Use move_to only to explore somewhere nothing is listed, using a waypoint or a point you choose.\n";
+        oss << " - You can only act on the creatures, objects and NPCs listed above. If a quest needs something not listed, travel until you find it.\n";
     }
 
     oss << FormatPlayerMessagesPromptSegment(bot);

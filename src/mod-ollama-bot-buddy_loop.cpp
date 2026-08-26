@@ -1572,6 +1572,22 @@ namespace
         time_t lastRequest { 0 };
     };
     std::unordered_map<uint64_t, OllamaBotState> ollamaBotStates;
+
+    // Replies from the HTTP worker threads, waiting to be executed on the world
+    // thread. The worker must not touch world state: executing a command reaches
+    // the MotionMaster and from there the Detour navmesh, and dtNavMeshQuery is
+    // not thread-safe against the map update running its own pathfinding for
+    // every other bot. That race stayed hidden while commands were short hops,
+    // and segfaulted the server the first time a bot pathed 350y across a zone.
+    struct PendingReply
+    {
+        ObjectGuid guid;
+        std::string prompt;
+        std::string reply;
+        double latency = 0.0;
+    };
+    std::mutex g_replyMutex;
+    std::vector<PendingReply> g_pendingReplies;
 }
 
 std::string EscapeBracesForFmt(const std::string& input) {
@@ -1589,9 +1605,79 @@ std::string EscapeBracesForFmt(const std::string& input) {
     return output;
 }
 
+// Runs on the world thread: parse the model's reply, execute the command, record
+// what really happened. Everything here may touch world state precisely because
+// of where it is called from.
+static void ProcessLlmReply(Player* bot, PendingReply const& pr)
+{
+    BotBuddy::ActionRecord record;
+
+    if (pr.reply.empty())
+    {
+        record.command = "none";
+        record.outcome = "the model returned nothing";
+    }
+    else
+    {
+        std::string jsonOnly = ExtractFirstJsonObject(pr.reply);
+        if (jsonOnly.empty())
+        {
+            record.command = "none";
+            record.outcome = "reply was not valid JSON";
+            LOG_ERROR("server.loading", "[OllamaBotBuddy] No valid JSON object found in LLM reply: {}", pr.reply);
+        }
+        else
+        {
+            try
+            {
+                auto root = nlohmann::json::parse(jsonOnly);
+                record.command   = root.value("command", nlohmann::json::object())
+                                       .value("type", std::string("none"));
+                record.params    = root.value("command", nlohmann::json::object())
+                                       .value("params", nlohmann::json::object()).dump();
+                record.reasoning = root.value("reasoning", std::string());
+            }
+            catch (...) {}
+
+            // Actions report their real outcome through SetLastOutcome; anything
+            // that does not gets the plain success/failure of the call itself.
+            bool executed = ParseAndExecuteBotJson(bot, jsonOnly);
+
+            bool outSucceeded = executed;
+            std::string outText;
+            if (!BotBuddy::PopPendingOutcome(bot, outSucceeded, outText))
+                outText = executed ? "" : "the action could not be carried out";
+
+            record.succeeded = outSucceeded;
+            record.outcome   = outText;
+
+            std::string updatedPrompt = BuildBotPrompt(bot);
+            SendBuddyBotStateToPlayer(bot, bot, updatedPrompt);
+        }
+    }
+
+    BotBuddy::PushAction(bot, record);
+    if (g_EnableOllamaBotBuddyJournal)
+        BotBuddy::WriteJournal(bot, pr.prompt, pr.reply, record, pr.latency);
+}
+
 void OllamaBotControlLoop::OnUpdate(uint32 /*diff*/)
 {
     if (!g_EnableOllamaBotControl) return;
+
+    // Execute any finished replies here on the world thread before requesting more.
+    std::vector<PendingReply> replies;
+    {
+        std::lock_guard<std::mutex> lock(g_replyMutex);
+        replies.swap(g_pendingReplies);
+    }
+    for (PendingReply const& pr : replies)
+    {
+        Player* bot = ObjectAccessor::FindPlayer(pr.guid);
+        if (bot && bot->IsInWorld())
+            ProcessLlmReply(bot, pr);
+        ollamaBotStates[pr.guid.GetRawValue()].busy = false;
+    }
 
     for (auto const& itr : ObjectAccessor::GetPlayers())
     {
@@ -1630,7 +1716,11 @@ void OllamaBotControlLoop::OnUpdate(uint32 /*diff*/)
                 //LOG_INFO("server.loading", "[OllamaBotBuddy] Sending prompt for bot '{}': {}", botName, prompt);
             }
 
-            std::thread([bot, guid, prompt]() {
+            // The worker does the HTTP call and nothing else. No Player*, no world
+            // state - the bot may log out (or the world may tick its navmesh) while
+            // this thread is blocked on the model. Execution happens in OnUpdate.
+            ObjectGuid botGuid = bot->GetGUID();
+            std::thread([botGuid, botName, prompt]() {
                 auto started = std::chrono::steady_clock::now();
                 std::string llmReply = QueryOllamaLLM(prompt);
                 double latency = std::chrono::duration<double>(
@@ -1639,61 +1729,11 @@ void OllamaBotControlLoop::OnUpdate(uint32 /*diff*/)
                 if (g_EnableOllamaBotBuddyDebug)
                 {
                     std::string safeJson = EscapeBracesForFmt(llmReply);
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] LLM reply for '{}':\n{}", bot->GetName(), safeJson);
+                    LOG_INFO("server.loading", "[OllamaBotBuddy] LLM reply for '{}':\n{}", botName, safeJson);
                 }
 
-                BotBuddy::ActionRecord record;
-
-                if (llmReply.empty())
-                {
-                    record.command = "none";
-                    record.outcome = "the model returned nothing";
-                }
-                else
-                {
-                    std::string jsonOnly = ExtractFirstJsonObject(llmReply);
-                    if (jsonOnly.empty())
-                    {
-                        record.command = "none";
-                        record.outcome = "reply was not valid JSON";
-                        LOG_ERROR("server.loading", "[OllamaBotBuddy] No valid JSON object found in LLM reply: {}", llmReply);
-                    }
-                    else
-                    {
-                        try
-                        {
-                            auto root = nlohmann::json::parse(jsonOnly);
-                            record.command   = root.value("command", nlohmann::json::object())
-                                                   .value("type", std::string("none"));
-                            record.params    = root.value("command", nlohmann::json::object())
-                                                   .value("params", nlohmann::json::object()).dump();
-                            record.reasoning = root.value("reasoning", std::string());
-                        }
-                        catch (...) {}
-
-                        // Actions report their real outcome through SetLastOutcome; anything
-                        // that does not gets the plain success/failure of the call itself.
-                        bool executed = ParseAndExecuteBotJson(bot, jsonOnly);
-
-                        bool outSucceeded = executed;
-                        std::string outText;
-                        if (!BotBuddy::PopPendingOutcome(bot, outSucceeded, outText))
-                            outText = executed ? "" : "the action could not be carried out";
-
-                        record.succeeded = outSucceeded;
-                        record.outcome   = outText;
-
-                        std::string updatedPrompt = BuildBotPrompt(bot);
-                        SendBuddyBotStateToPlayer(bot, bot, updatedPrompt);
-                    }
-                }
-
-                BotBuddy::PushAction(bot, record);
-                if (g_EnableOllamaBotBuddyJournal)
-                    BotBuddy::WriteJournal(bot, prompt, llmReply, record, latency);
-
-                // Mark ready for the next request
-                ollamaBotStates[guid].busy = false;
+                std::lock_guard<std::mutex> lock(g_replyMutex);
+                g_pendingReplies.push_back({botGuid, prompt, llmReply, latency});
             }).detach();
         }
     }

@@ -83,7 +83,23 @@ namespace BotBuddyAI
             if (g_EnableOllamaBotBuddyDebug) {
                 LOG_INFO("server.loading", "[OllamaBotBuddy] Target not found or not in LOS for guid: {}", guid.GetCounter());
             }
+            BotBuddy::SetLastOutcome(bot, false,
+                "you cannot see that target - it is gone, or something is between you and it. "
+                "Pick a target from your visible list");
             return false;
+        }
+
+        // Check if target is dead - if so, refuse to attack and suggest looting instead
+        if (!target->IsAlive()) {
+            if (g_EnableOllamaBotBuddyDebug) {
+                LOG_INFO("server.loading", "[OllamaBotBuddy] REFUSING to attack dead target: {} - it should be looted, not attacked", target->GetName());
+            }
+            // You killed it. Saying so turns three wasted turns of re-attacking a
+            // corpse into the loot that was the point of the fight.
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is already dead - you killed it. Loot it with loot {{\"guid\":{}}}",
+                target->GetName(), guid.GetCounter()));
+            return false; // Explicitly refuse to attack dead creatures
         }
 
         // CRITICAL: Validate target before attacking to prevent friendly fire
@@ -91,6 +107,8 @@ namespace BotBuddyAI
             if (g_EnableOllamaBotBuddyDebug) {
                 LOG_INFO("server.loading", "[OllamaBotBuddy] Invalid attack target: {} - not attackable", target->GetName());
             }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} cannot be attacked. Choose a different target", target->GetName()));
             return false;
         }
 
@@ -99,6 +117,9 @@ namespace BotBuddyAI
             if (g_EnableOllamaBotBuddyDebug) {
                 LOG_INFO("server.loading", "[OllamaBotBuddy] Refusing to attack friendly target: {}", target->GetName());
             }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is friendly - you will not attack it. Choose a hostile or neutral target",
+                target->GetName()));
             return false;
         }
 
@@ -112,14 +133,6 @@ namespace BotBuddyAI
             }
         }
 
-        // Check if target is dead - if so, refuse to attack and suggest looting instead
-        if (!target->IsAlive()) {
-            if (g_EnableOllamaBotBuddyDebug) {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] REFUSING to attack dead target: {} - it should be looted, not attacked", target->GetName());
-            }
-            return false; // Explicitly refuse to attack dead creatures
-        }
-        
         // Check if target is GM
         if (target->ToPlayer() && target->ToPlayer()->IsGameMaster()) {
             if (g_EnableOllamaBotBuddyDebug) {

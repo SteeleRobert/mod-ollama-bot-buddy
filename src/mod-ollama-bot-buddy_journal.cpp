@@ -33,6 +33,26 @@ namespace BotBuddy
         return true;
     }
 
+    bool IsRepeatingFailure(Player* bot, std::string const& command,
+                            std::string const& params, uint32 threshold, uint32& streak)
+    {
+        streak = 0;
+        if (!bot || !threshold) return false;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_history.find(bot->GetGUID().GetRawValue());
+        if (it == g_history.end()) return false;
+
+        auto const& dq = it->second;
+        for (size_t i = dq.size(); i-- > 0; )
+        {
+            ActionRecord const& r = dq[i];
+            if (r.succeeded || r.command != command || r.params != params)
+                break;
+            ++streak;
+        }
+        return streak >= threshold;
+    }
+
     void PushAction(Player* bot, ActionRecord record)
     {
         if (!bot) return;

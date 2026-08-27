@@ -1727,17 +1727,38 @@ static void ProcessLlmReply(Player* bot, PendingReply const& pr)
             }
             catch (...) {}
 
-            // Actions report their real outcome through SetLastOutcome; anything
-            // that does not gets the plain success/failure of the call itself.
-            bool executed = ParseAndExecuteBotJson(bot, jsonOnly);
+            // Circuit breaker: specific outcomes and an explicit STOP line proved
+            // insufficient at scale - a bot ran the same failing interact 122
+            // times in a row, each retry ~5s apart, each refusal identical. Past
+            // three consecutive identical failures the harness stops executing
+            // the action at all; anything different resets the streak, so the
+            // model keeps its full command set minus the one proven dead end.
+            uint32 failStreak = 0;
+            if (record.command != "none" &&
+                BotBuddy::IsRepeatingFailure(bot, record.command, record.params, 3, failStreak))
+            {
+                record.succeeded = false;
+                record.outcome = fmt::format(
+                    "REFUSED TO RUN: {} with these exact params has failed {} times in a row "
+                    "and is disabled until you do something else. It does not matter why you "
+                    "think it will work this time - it will not. Choose a different command, "
+                    "a different target, or move somewhere else.",
+                    record.command, failStreak);
+            }
+            else
+            {
+                // Actions report their real outcome through SetLastOutcome; anything
+                // that does not gets the plain success/failure of the call itself.
+                bool executed = ParseAndExecuteBotJson(bot, jsonOnly);
 
-            bool outSucceeded = executed;
-            std::string outText;
-            if (!BotBuddy::PopPendingOutcome(bot, outSucceeded, outText))
-                outText = executed ? "" : "the action could not be carried out";
+                bool outSucceeded = executed;
+                std::string outText;
+                if (!BotBuddy::PopPendingOutcome(bot, outSucceeded, outText))
+                    outText = executed ? "" : "the action could not be carried out";
 
-            record.succeeded = outSucceeded;
-            record.outcome   = outText;
+                record.succeeded = outSucceeded;
+                record.outcome   = outText;
+            }
 
             std::string updatedPrompt = BuildBotPrompt(bot);
             SendBuddyBotStateToPlayer(bot, bot, updatedPrompt);

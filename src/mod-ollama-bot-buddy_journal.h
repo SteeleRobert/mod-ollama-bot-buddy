@@ -43,4 +43,11 @@ namespace BotBuddy
 
     /// Outcome of the action currently being executed (set by SetLastOutcome).
     bool PopPendingOutcome(Player* bot, bool& succeeded, std::string& outcome);
+
+    /// True when this bot's last `threshold`-or-more actions were all this exact
+    /// command+params and all failed. `streak` returns the run length. Used as a
+    /// circuit breaker: past that point the harness refuses to run the action
+    /// again, because advisory feedback has demonstrably stopped working.
+    bool IsRepeatingFailure(Player* bot, std::string const& command,
+                            std::string const& params, uint32 threshold, uint32& streak);
 }

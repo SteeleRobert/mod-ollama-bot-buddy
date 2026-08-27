@@ -63,6 +63,9 @@ namespace BotBuddyAI
     /// Sell every grey item to the vendor with this guid. Grey can never be quest
     /// or equipped gear, so this is always safe.
     bool SellJunk(Player* bot, uint32 lowGuid);
+    /// Equip anything in the bags that beats what is worn (quality, then item
+    /// level; greys excluded). Returns a summary of what was equipped, or "".
+    std::string EquipUpgradesFromBags(Player* bot);
     bool AutoNavigateGossipForQuests(Player* bot, Creature* creature);
     bool HasQuestsAvailable(Player* bot, WorldObject* questGiver);
     /// Loot a corpse. lowGuid is the guid the model saw in its visible list;

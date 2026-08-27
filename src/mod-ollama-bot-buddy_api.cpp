@@ -406,8 +406,11 @@ namespace BotBuddyAI
                 if (gold)
                     got += fmt::format("{}{} copper", taken.empty() ? "" : ", ", gold);
 
-                BotBuddy::SetLastOutcome(bot, true, fmt::format(
-                    "opened {} and took {}", go->GetGOInfo()->name, got));
+                std::string chestOutcome = fmt::format(
+                    "opened {} and took {}", go->GetGOInfo()->name, got);
+                if (std::string worn = EquipUpgradesFromBags(bot); !worn.empty())
+                    chestOutcome += " - and " + worn;
+                BotBuddy::SetLastOutcome(bot, true, chestOutcome);
                 return true;
             }
             else
@@ -562,6 +565,75 @@ namespace BotBuddyAI
                             if (it->GetTemplate()->Quality == ITEM_QUALITY_POOR && it->GetTemplate()->SellPrice)
                                 out.push_back(it);
         }
+    }
+
+    namespace
+    {
+        // Quality first, then item level - crude, but monotonic enough for
+        // leveling gear, and it never has to be argued with.
+        uint32 GearScore(ItemTemplate const* proto)
+        {
+            return proto->Quality * 1000 + proto->ItemLevel;
+        }
+
+        void CollectBagWearables(Player* bot, std::vector<Item*>& out)
+        {
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    out.push_back(it);
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+                if (Bag* bag = bot->GetBagByPos(bagSlot))
+                    for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                        if (Item* it = bag->GetItemByPos(slot))
+                            out.push_back(it);
+        }
+    }
+
+    // Wear the best of what is in the bags. Runs after loot, not on a model
+    // decision: comparing two pairs of pants is mechanical optimisation, the same
+    // category as a combat rotation, and burning a 5-second LLM turn on it would
+    // buy nothing but the chance of a wrong answer. Greys are skipped so they
+    // stay sellable, and CanEquipItem is the game's own judgement of usability.
+    std::string EquipUpgradesFromBags(Player* bot)
+    {
+        std::vector<Item*> candidates;
+        CollectBagWearables(bot, candidates);
+
+        std::vector<std::string> equipped;
+        for (Item* it : candidates)
+        {
+            ItemTemplate const* proto = it->GetTemplate();
+            if (!proto || proto->InventoryType == INVTYPE_NON_EQUIP) continue;
+            if (proto->Quality <= ITEM_QUALITY_POOR) continue;   // junk stays junk
+            if (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON) continue;
+
+            uint16 dest = 0;
+            if (bot->CanEquipItem(NULL_SLOT, dest, it, true) != EQUIP_ERR_OK)
+                continue;
+
+            uint8 destSlot = dest & 255;
+            Item* worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, destSlot);
+            if (worn && GearScore(worn->GetTemplate()) >= GearScore(proto))
+                continue;
+
+            std::string replacedNote = worn
+                ? fmt::format(" (replacing {})", worn->GetTemplate()->Name1)
+                : "";
+
+            uint16 src = (uint16(it->GetBagSlot()) << 8) | it->GetSlot();
+            bot->SwapItem(src, dest);
+
+            // Verify it actually landed - SwapItem can refuse (bind prompts, etc.)
+            Item* nowWorn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, destSlot);
+            if (nowWorn && nowWorn->GetEntry() == proto->ItemId)
+                equipped.push_back(proto->Name1 + replacedNote);
+        }
+
+        if (equipped.empty()) return "";
+        std::string out = "equipped ";
+        for (size_t i = 0; i < equipped.size(); ++i)
+            out += (i ? ", " : "") + equipped[i];
+        return out;
     }
 
     // One compact paragraph of bag state for the prompt. Without it the model has
@@ -1602,8 +1674,10 @@ namespace BotBuddyAI
         if (gold)
             got += fmt::format("{}{} copper", taken.empty() ? "" : ", ", gold);
 
-        BotBuddy::SetLastOutcome(bot, true,
-            fmt::format("looted {} from {}", got, corpse->GetName()));
+        std::string outcomeText = fmt::format("looted {} from {}", got, corpse->GetName());
+        if (std::string worn = EquipUpgradesFromBags(bot); !worn.empty())
+            outcomeText += " - and " + worn;
+        BotBuddy::SetLastOutcome(bot, true, outcomeText);
 
         if (g_EnableOllamaBotBuddyDebug)
             LOG_INFO("server.loading", "[OllamaBotBuddy] {} looted {} from {}",

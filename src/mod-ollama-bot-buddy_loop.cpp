@@ -1773,6 +1773,11 @@ void OllamaBotControlLoop::OnUpdate(uint32 /*diff*/)
         if (!state.strategiesConfigured)
         {
             ai->ResetStrategies();   // restore the default engines we may have wiped
+            // Catch-up pass: wear the best of whatever accumulated in the bags
+            // before this run (upgrades looted while no equip logic existed).
+            std::string worn = BotBuddyAI::EquipUpgradesFromBags(bot);
+            if (!worn.empty())
+                LOG_INFO("server.loading", "[OllamaBotBuddy] {} on designation: {}", botName, worn);
             state.strategiesConfigured = true;
         }
         ai->ClearStrategies(BOT_STATE_NON_COMBAT);

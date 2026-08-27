@@ -78,3 +78,17 @@ OllamaBotControl.Journal = 1
 #        Default:     1 (enabled)
 
 OllamaBotControl.StrictSchema = 1
+
+#
+#    OllamaBotControl.Think
+#        Description: Reasoning control for thinking models (qwen3.5, nemotron, ...).
+#                     Thinking models put every token into "thinking" and return an
+#                     empty "response" unless told not to, which the journal records
+#                     as "the model returned nothing" on every call.
+#                       -1 = omit the flag (default; REQUIRED for models without
+#                            thinking support - Ollama rejects the flag on those)
+#                        0 = send "think": false  (use this for thinking models)
+#                        1 = send "think": true
+#        Default:     -1
+
+OllamaBotControl.Think = -1

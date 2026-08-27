@@ -21,6 +21,7 @@ enum class BotControlCommandType
     Say,
     AcceptQuest,
     TurnInQuest,
+    SellJunk,
     Stop
 };
 
@@ -57,6 +58,11 @@ namespace BotBuddyAI
     std::string QuestItemSourceHint(Player* bot, uint32 itemId);
     /// Nearest live spawn of a kill-objective creature, as a place the model can use.
     std::string QuestKillTargetHint(Player* bot, uint32 creatureEntry);
+    /// Bag usage, money, and sellable grey junk, one short paragraph for the prompt.
+    std::string BagSummary(Player* bot);
+    /// Sell every grey item to the vendor with this guid. Grey can never be quest
+    /// or equipped gear, so this is always safe.
+    bool SellJunk(Player* bot, uint32 lowGuid);
     bool AutoNavigateGossipForQuests(Player* bot, Creature* creature);
     bool HasQuestsAvailable(Player* bot, WorldObject* questGiver);
     /// Loot a corpse. lowGuid is the guid the model saw in its visible list;

@@ -297,6 +297,17 @@ bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
                 return false;
             }
         }
+        else if (type == "sell_junk")
+        {
+            if (params.contains("guid") && params["guid"].is_number()) {
+                command.type = BotControlCommandType::SellJunk;
+                command.args = { std::to_string(params["guid"].get<uint32_t>()) };
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] sell_junk missing guid");
+                BotBuddy::SetLastOutcome(bot, false, "sell_junk needs the \"guid\" of a [VENDOR] from your visible list");
+                return false;
+            }
+        }
         else if (type == "loot")
         {
             command.type = BotControlCommandType::Loot;
@@ -1346,6 +1357,7 @@ static std::string QueryOllamaLLM(const std::string& prompt)
             guidCmd("attack"),
             guidCmd("interact"),
             guidCmd("move_to_target"),
+            guidCmd("sell_junk"),
             // cast: spellid required, guid optional (omitted = cast on yourself)
             {
                 {"type", "object"},
@@ -1479,6 +1491,7 @@ static std::string BuildBotPrompt(Player* bot)
     oss << GetCombatSummary(bot) << "\n\n";
 
     oss << "Your known spells:\n" << GetBotSpellInfo(bot) << "\n\n";
+    oss << BotBuddyAI::BagSummary(bot) << "\n";
 
     oss << "Group status: " << botGroupStatus << "\n";
     if (!groupInfo.empty()) {
@@ -1593,11 +1606,12 @@ How to choose:
 - Anything marked [IN RANGE - ...] is close enough already, and the mark says which command to use on it. Use that command this turn; do not move to it again.
 - attack starts the fight and hands it to your character's combat training: the full ability rotation, positioning and targeting run automatically until the fight ends, and you decide again afterwards. Pick the target; do not micro-manage the fight.
 - cast is for out-of-combat abilities: Stealth before approaching danger, Throw to pull something from range, a heal or buff before the next fight.
+- When your bags list grey junk and you are near a [VENDOR], sell it with sell_junk - it only sells worthless grey items, never gear or quest items, so it is always safe. Do not make a special trip just to sell; do it when you pass a vendor anyway.
 - interact is only for NPCs and objects you can talk to or use. Beasts and monsters are not; you attack those.
 - Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
 
 Reply with a single JSON object and nothing else, in exactly this shape:
-{"command":{"type":"<one of: move_to_target, move_to, attack, cast, interact, loot, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
+{"command":{"type":"<one of: move_to_target, move_to, attack, cast, interact, loot, sell_junk, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
 
 params by command type:
   move_to      {"x":<float>,"y":<float>,"z":<float>}
@@ -1605,6 +1619,7 @@ params by command type:
   cast         {"spellid":<ID from your known spells>,"guid":<target guid; omit to cast on yourself>}
   interact     {"guid":<guid from your visible list>}
   loot         {"guid":<guid of a corpse marked DEAD (LOOTABLE)>}
+  sell_junk    {"guid":<guid of a [VENDOR] from your visible list>}
   accept_quest {"id":<quest id>}
   turn_in_quest{"id":<quest id>})";
 

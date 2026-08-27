@@ -534,6 +534,152 @@ namespace BotBuddyAI
         return "(none near you right now - travel to find them)";
     }
 
+    namespace
+    {
+        std::string FormatMoney(uint32 copper)
+        {
+            uint32 g = copper / 10000, sv = (copper % 10000) / 100, c = copper % 100;
+            std::string out;
+            if (g)  out += fmt::format("{} gold ", g);
+            if (sv) out += fmt::format("{} silver ", sv);
+            if (c || out.empty()) out += fmt::format("{} copper", c);
+            while (!out.empty() && out.back() == ' ') out.pop_back();
+            return out;
+        }
+
+        // Every grey (vendor-trash) item in the bags. Grey quality can never be a
+        // quest item or equipped gear, so selling it is always safe.
+        void CollectGreyItems(Player* bot, std::vector<Item*>& out)
+        {
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    if (it->GetTemplate()->Quality == ITEM_QUALITY_POOR && it->GetTemplate()->SellPrice)
+                        out.push_back(it);
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+                if (Bag* bag = bot->GetBagByPos(bagSlot))
+                    for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                        if (Item* it = bag->GetItemByPos(slot))
+                            if (it->GetTemplate()->Quality == ITEM_QUALITY_POOR && it->GetTemplate()->SellPrice)
+                                out.push_back(it);
+        }
+    }
+
+    // One compact paragraph of bag state for the prompt. Without it the model has
+    // no idea what it is carrying: loot outcomes scroll out of the history window
+    // and the items effectively stop existing, so bags silently fill with vendor
+    // trash it has no reason to ever sell.
+    std::string BagSummary(Player* bot)
+    {
+        uint32 total = 0, used = 0;
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+            ++total;
+            if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot)) ++used;
+        }
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            if (Bag* bag = bot->GetBagByPos(bagSlot))
+            {
+                total += bag->GetBagSize();
+                used  += bag->GetBagSize() - bag->GetFreeSlots();
+            }
+
+        std::string out = fmt::format("Your bags: {}/{} slots used. Money: {}.\n",
+                                      used, total, FormatMoney(bot->GetMoney()));
+
+        std::vector<Item*> grey;
+        CollectGreyItems(bot, grey);
+        if (!grey.empty())
+        {
+            std::unordered_map<uint32, uint32> counts;
+            std::unordered_map<uint32, ItemTemplate const*> protos;
+            uint32 value = 0;
+            for (Item* it : grey)
+            {
+                counts[it->GetEntry()] += it->GetCount();
+                protos[it->GetEntry()] = it->GetTemplate();
+                value += it->GetTemplate()->SellPrice * it->GetCount();
+            }
+            out += "Grey junk you could sell";
+            bool first = true;
+            for (auto const& [entry, n] : counts)
+            {
+                out += first ? ": " : ", ";
+                first = false;
+                out += n > 1 ? fmt::format("{}x {}", n, protos[entry]->Name1)
+                             : protos[entry]->Name1;
+            }
+            out += fmt::format(" - worth {} at any [VENDOR] (use sell_junk)\n", FormatMoney(value));
+        }
+        return out;
+    }
+
+    // Sell every grey item to a vendor the bot is standing next to.
+    bool SellJunk(Player* bot, uint32 lowGuid)
+    {
+        if (!bot || !bot->GetMap()) return false;
+
+        Creature* vendor = nullptr;
+        for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+            if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
+                { vendor = pair.second; break; }
+
+        if (!vendor || !vendor->IsAlive())
+        {
+            BotBuddy::SetLastOutcome(bot, false,
+                "no vendor with that guid is here - pick one marked [VENDOR] from your visible list");
+            return false;
+        }
+        if (!vendor->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is not a vendor and buys nothing - find someone marked [VENDOR]",
+                vendor->GetName()));
+            return false;
+        }
+        float dist = bot->GetDistance(vendor);
+        if (dist > INTERACTION_DISTANCE)
+        {
+            float angle = vendor->GetAngle(bot);
+            bot->GetMotionMaster()->Clear();
+            bot->GetMotionMaster()->MovePoint(0,
+                vendor->GetPositionX() + cos(angle + M_PI) * 3.0f,
+                vendor->GetPositionY() + sin(angle + M_PI) * 3.0f,
+                vendor->GetPositionZ());
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far to trade with {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                vendor->GetName(), dist, (float)INTERACTION_DISTANCE));
+            return false;
+        }
+
+        std::vector<Item*> grey;
+        CollectGreyItems(bot, grey);
+        if (grey.empty())
+        {
+            BotBuddy::SetLastOutcome(bot, false,
+                "you have no grey junk to sell - your bags hold only things worth keeping");
+            return false;
+        }
+
+        uint32 earned = 0, sold = 0;
+        for (Item* it : grey)
+        {
+            earned += it->GetTemplate()->SellPrice * it->GetCount();
+            sold   += it->GetCount();
+            bot->MoveItemFromInventory(it->GetBagSlot(), it->GetSlot(), true);
+            it->DestroyForPlayer(bot);
+        }
+        bot->ModifyMoney(int32(earned));
+
+        BotBuddy::SetLastOutcome(bot, true, fmt::format(
+            "sold {} pieces of junk to {} for {}. You now have {}",
+            sold, vendor->GetName(), FormatMoney(earned), FormatMoney(bot->GetMoney())));
+
+        if (g_EnableOllamaBotBuddyDebug)
+            LOG_INFO("server.loading", "[OllamaBotBuddy] {} sold {} items for {} copper",
+                bot->GetName(), sold, earned);
+        return true;
+    }
+
     // Who takes this quest when it is done, and where they are right now. The
     // quest log tells the bot a quest is READY TO TURN IN but not to whom - and a
     // model with no name to anchor on invents one from its pretraining ("move
@@ -1709,6 +1855,15 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
             {
                 uint32 questId = std::stoi(command.args[0]);
                 return BotBuddyAI::TurnInQuest(bot, questId);
+            }
+            break;
+        case BotControlCommandType::SellJunk:
+            if (!command.args.empty())
+            {
+                uint32 vendorGuid = 0;
+                try { vendorGuid = std::stoul(command.args[0]); }
+                catch (const std::exception&) { return false; }
+                return BotBuddyAI::SellJunk(bot, vendorGuid);
             }
             break;
         case BotControlCommandType::Loot:

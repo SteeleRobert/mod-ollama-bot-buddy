@@ -351,18 +351,74 @@ namespace BotBuddyAI
             {
                 return InteractWithQuestGiver(bot, go);
             }
+            else if (go->GetGoType() == GAMEOBJECT_TYPE_CHEST)
+            {
+                // Open and empty the chest directly - the same server-side flow the
+                // client triggers, minus the client. The playerbots "use" action this
+                // used to delegate to is another casualty of ClearStrategies: the bot
+                // stood 5y from Felix's Chest being told it "would not open" while
+                // holding the very quest that unlocks it.
+                bot->SetFacingToObject(go);
+                bot->SendLoot(go->GetGUID(), LOOT_CORPSE);
+
+                Loot* loot = &go->loot;
+                std::vector<std::string> taken;
+                uint32 gold = loot->gold;
+                if (gold)
+                {
+                    bot->ModifyMoney(gold);
+                    loot->gold = 0;
+                    loot->NotifyMoneyRemoved();
+                }
+
+                uint32 maxSlot = loot->GetMaxSlotInLootFor(bot);
+                std::string blocked;
+                for (uint32 slot = 0; slot < maxSlot; ++slot)
+                {
+                    InventoryResult imsg = EQUIP_ERR_OK;
+                    LootItem* item = bot->StoreLootItem(uint8(slot), loot, imsg);
+                    if (item && imsg == EQUIP_ERR_OK)
+                    {
+                        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item->itemid))
+                            taken.push_back(item->count > 1
+                                ? fmt::format("{}x {}", uint32(item->count), proto->Name1)
+                                : proto->Name1);
+                    }
+                    else if (imsg == EQUIP_ERR_INVENTORY_FULL)
+                        blocked = "your bags are full";
+                }
+
+                // Releases the loot window server-side and lets a consumable quest
+                // chest despawn/respawn exactly as it would for a real player.
+                bot->GetSession()->DoLootRelease(go->GetGUID());
+
+                if (taken.empty() && !gold)
+                {
+                    BotBuddy::SetLastOutcome(bot, false, blocked.empty()
+                        ? fmt::format("{} was empty - nothing inside for you", go->GetGOInfo()->name)
+                        : fmt::format("could not take what is in {} - {}", go->GetGOInfo()->name, blocked));
+                    return false;
+                }
+
+                std::string got;
+                for (size_t i = 0; i < taken.size(); ++i)
+                    got += (i ? ", " : "") + taken[i];
+                if (gold)
+                    got += fmt::format("{}{} copper", taken.empty() ? "" : ", ", gold);
+
+                BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                    "opened {} and took {}", go->GetGOInfo()->name, got));
+                return true;
+            }
             else
             {
-                // Use the bot's AI system to handle interaction with game objects
+                // Levers, gongs, quest gadgets: activate the object directly and let
+                // its own scripts (including quest credit) run.
                 bot->SetFacingToObject(go);
-                Event event = Event("", go->GetGOInfo()->name);
-                if (ai->DoSpecificAction("use", event))
-                    return true;
-
-                BotBuddy::SetLastOutcome(bot, false, fmt::format(
-                    "{} would not open - it may be locked, empty, or need something you do not "
-                    "have. Try something else", go->GetGOInfo()->name));
-                return false;
+                go->Use(bot);
+                BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                    "used {}", go->GetGOInfo()->name));
+                return true;
             }
         }
 

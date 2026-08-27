@@ -1,4 +1,10 @@
 #pragma once
+
+// Gameobject guids shown to the model are offset into their own numeric range so
+// they can never collide with creature spawn ids (see mod-ollama-bot-buddy_api.cpp).
+#ifndef GO_GUID_OFFSET
+#define GO_GUID_OFFSET 1000000000u
+#endif
 #include "Player.h"
 #include <string>
 #include <vector>
@@ -6,6 +12,7 @@
 enum class BotControlCommandType
 {
     MoveTo,
+    MoveToTarget,
     Attack,
     Interact,
     CastSpell,
@@ -14,6 +21,7 @@ enum class BotControlCommandType
     Say,
     AcceptQuest,
     TurnInQuest,
+    SellJunk,
     Stop
 };
 
@@ -42,9 +50,27 @@ namespace BotBuddyAI
     bool AcceptQuest(Player* bot, uint32 questId);
     bool TurnInQuest(Player* bot, uint32 questId);
     bool InteractWithQuestGiver(Player* bot, WorldObject* questGiver);
+    /// "Talin Keeneye (guid: N, Position: x y z, Distance: d)" for the NPC that
+    /// takes questId when finished; empty if none is known.
+    std::string QuestEnderHint(Player* bot, uint32 questId);
+    /// Where a quest item comes from on this server - "drops from X (guid, position,
+    /// distance)" / "found inside Y ..." - resolved from loot tables, cached per item.
+    std::string QuestItemSourceHint(Player* bot, uint32 itemId);
+    /// Nearest live spawn of a kill-objective creature, as a place the model can use.
+    std::string QuestKillTargetHint(Player* bot, uint32 creatureEntry);
+    /// Bag usage, money, and sellable grey junk, one short paragraph for the prompt.
+    std::string BagSummary(Player* bot);
+    /// Sell every grey item to the vendor with this guid. Grey can never be quest
+    /// or equipped gear, so this is always safe.
+    bool SellJunk(Player* bot, uint32 lowGuid);
+    /// Equip anything in the bags that beats what is worn (quality, then item
+    /// level; greys excluded). Returns a summary of what was equipped, or "".
+    std::string EquipUpgradesFromBags(Player* bot);
     bool AutoNavigateGossipForQuests(Player* bot, Creature* creature);
     bool HasQuestsAvailable(Player* bot, WorldObject* questGiver);
-    bool LootNearby(Player* bot);
+    /// Loot a corpse. lowGuid is the guid the model saw in its visible list;
+    /// 0 means "the nearest corpse you are allowed to loot".
+    bool LootCorpse(Player* bot, uint32 lowGuid);
     bool Interact(Player* bot, ObjectGuid guid);
     
     // Quest-related helper functions

@@ -30,3 +30,51 @@ OllamaBotControl.Debug = 0
 #     Default:     0 (false)
 #     0 = disabled, 1 = enabled
 OllamaBotControl.EnableBotBuddyAddon = 0
+#
+#    OllamaBotControl.BotNames
+#        Description: Comma-separated character names of the bots to place under LLM control.
+#                     Each named bot has its normal playerbot AI cleared and is driven entirely
+#                     by the LLM decision loop. All other bots are untouched and keep the
+#                     classical playerbot AI, so LLM and classical bots coexist in one world.
+#                     Empty means no bots are controlled (module stays inert).
+#        Example:     OllamaBotControl.BotNames = Thillagle,Gnotez
+#        Default:     "" (none)
+
+OllamaBotControl.BotNames = ""
+
+#
+#    OllamaBotControl.HistoryDepth
+#        Description: How many of the bot's past actions - with what actually happened
+#                     to each - are shown to the model in its next prompt. Real outcomes
+#                     are how the model learns it was too far away, out of range, or
+#                     repeating itself.
+#        Default:     6
+
+OllamaBotControl.HistoryDepth = 6
+
+#
+#    OllamaBotControl.Journal
+#        Description: Persist every decision to the `mod_ollama_bot_buddy_journal` table
+#                     in the characters database: the full prompt, the raw reply, the
+#                     chosen command, whether it worked, what happened, and how long the
+#                     model took. Use it to review and compare runs after the fact.
+#        Default:     1 (enabled)
+
+OllamaBotControl.Journal = 1
+
+#
+#    OllamaBotControl.StrictSchema
+#        Description: Constrain replies with a full JSON schema, so the command name,
+#                     the parameter names and their types are all guaranteed correct.
+#                     Much stronger than plain JSON mode, which can return well-formed
+#                     but unusable commands (an attack with empty params, a guid sent
+#                     as a string).
+#
+#                     Ollama's MLX runner accepts a schema and silently ignores it
+#                     (ollama/ollama#17013, #16563); the GGUF/llama.cpp runner enforces
+#                     it. If your model tag ends in -mlx, either set this to 0 or, far
+#                     better, use the GGUF build of the same model - it was both more
+#                     accurate and no slower in testing.
+#        Default:     1 (enabled)
+
+OllamaBotControl.StrictSchema = 1

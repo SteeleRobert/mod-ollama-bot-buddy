@@ -1,4 +1,5 @@
 #include "mod-ollama-bot-buddy_api.h"
+#include "mod-ollama-bot-buddy_journal.h"
 #include "mod-ollama-bot-buddy_config.h"
 #include "mod-ollama-bot-buddy_loop.h"
 #include "Playerbots.h"
@@ -17,10 +18,19 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include "GossipDef.h"
+#include "LootMgr.h"
+#include "DatabaseEnv.h"
 #include <sstream>
 
 // Constants for interaction and combat ranges
 #define INTERACTION_DISTANCE 5.5f
+
+// Creature and gameobject spawn ids are separate numbering spaces. Printing both
+// raw invited a collision the model cannot see: a hint named Felix's Chest by GO
+// guid 1937, resolution checked creatures first, found a Goretusk in Westfall
+// with the same number, and a level-5 rogue set off across Searing Gorge to talk
+// to it. Object guids are therefore printed offset into their own range, and
+// resolution routes by range instead of guessing. (Constant lives in the header.)
 #define ATTACK_DISTANCE 5.0f
 
 namespace BotBuddyAI
@@ -81,7 +91,23 @@ namespace BotBuddyAI
             if (g_EnableOllamaBotBuddyDebug) {
                 LOG_INFO("server.loading", "[OllamaBotBuddy] Target not found or not in LOS for guid: {}", guid.GetCounter());
             }
+            BotBuddy::SetLastOutcome(bot, false,
+                "you cannot see that target - it is gone, or something is between you and it. "
+                "Pick a target from your visible list");
             return false;
+        }
+
+        // Check if target is dead - if so, refuse to attack and suggest looting instead
+        if (!target->IsAlive()) {
+            if (g_EnableOllamaBotBuddyDebug) {
+                LOG_INFO("server.loading", "[OllamaBotBuddy] REFUSING to attack dead target: {} - it should be looted, not attacked", target->GetName());
+            }
+            // You killed it. Saying so turns three wasted turns of re-attacking a
+            // corpse into the loot that was the point of the fight.
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is already dead - you killed it. Loot it with loot {{\"guid\":{}}}",
+                target->GetName(), guid.GetCounter()));
+            return false; // Explicitly refuse to attack dead creatures
         }
 
         // CRITICAL: Validate target before attacking to prevent friendly fire
@@ -89,6 +115,8 @@ namespace BotBuddyAI
             if (g_EnableOllamaBotBuddyDebug) {
                 LOG_INFO("server.loading", "[OllamaBotBuddy] Invalid attack target: {} - not attackable", target->GetName());
             }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} cannot be attacked. Choose a different target", target->GetName()));
             return false;
         }
 
@@ -97,6 +125,9 @@ namespace BotBuddyAI
             if (g_EnableOllamaBotBuddyDebug) {
                 LOG_INFO("server.loading", "[OllamaBotBuddy] Refusing to attack friendly target: {}", target->GetName());
             }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is friendly - you will not attack it. Choose a hostile or neutral target",
+                target->GetName()));
             return false;
         }
 
@@ -110,14 +141,6 @@ namespace BotBuddyAI
             }
         }
 
-        // Check if target is dead - if so, refuse to attack and suggest looting instead
-        if (!target->IsAlive()) {
-            if (g_EnableOllamaBotBuddyDebug) {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] REFUSING to attack dead target: {} - it should be looted, not attacked", target->GetName());
-            }
-            return false; // Explicitly refuse to attack dead creatures
-        }
-        
         // Check if target is GM
         if (target->ToPlayer() && target->ToPlayer()->IsGameMaster()) {
             if (g_EnableOllamaBotBuddyDebug) {
@@ -225,25 +248,24 @@ namespace BotBuddyAI
 
         if (Creature* creature = ObjectAccessor::GetCreature(*bot, guid))
         {
-            // Check interaction distance FIRST - move closer if needed
+            // Out of range: walk there, but report what actually happened rather than
+            // claiming the interaction succeeded. The model only learns to close the
+            // distance if the outcome it sees says the interaction did not happen.
             float distance = bot->GetDistance(creature);
             if (distance > INTERACTION_DISTANCE)
             {
-                // Too far - move closer first
-                if (g_EnableOllamaBotBuddyDebug) {
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} moving to interact with {} at distance {:.1f}", 
-                        bot->GetName(), creature->GetName(), distance);
-                }
-                
-                // Calculate a position close to the creature but not directly on top
                 float angle = creature->GetAngle(bot);
                 float destX = creature->GetPositionX() + cos(angle + M_PI) * 3.0f; // 3 yards away
                 float destY = creature->GetPositionY() + sin(angle + M_PI) * 3.0f;
                 float destZ = creature->GetPositionZ();
-                
+
                 bot->GetMotionMaster()->Clear();
                 bot->GetMotionMaster()->MovePoint(0, destX, destY, destZ);
-                return true; // Movement initiated, interaction will happen next cycle
+
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "too far to interact with {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                    creature->GetName(), distance, (float)INTERACTION_DISTANCE));
+                return false;
             }
             
             // Check if this is a quest giver and handle quest interaction properly
@@ -251,12 +273,50 @@ namespace BotBuddyAI
             {
                 return InteractWithQuestGiver(bot, creature);
             }
-            else
+            // Not everything you can stand next to is something you can talk to. A
+            // wolf has no gossip and no quests, so "gossip hello" fails - and saying
+            // only that it failed leaves the model to conclude it should try again.
+            // Name the verb that does apply instead.
+            bool talkable =
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP)       ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR)       ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_TRAINER)      ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_FLIGHTMASTER) ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_INNKEEPER)    ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_BANKER)       ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_SPIRITHEALER) ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_AUCTIONEER)   ||
+                creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_REPAIR);
+
+            if (!talkable)
             {
-                // For non-quest NPCs, use gossip hello action
+                if (creature->isDead())
+                    BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                        "{} is a corpse - you do not talk to it. Loot it with loot {{\"guid\":{}}}",
+                        creature->GetName(), guid.GetCounter()));
+                else if (bot->IsValidAttackTarget(creature))
+                    BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                        "{} is a creature, not someone you can talk to. interact will never work "
+                        "on it. Kill it instead: attack {{\"guid\":{}}}",
+                        creature->GetName(), guid.GetCounter()));
+                else
+                    BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                        "{} has nothing to say and nothing to offer - leave it alone",
+                        creature->GetName()));
+                return false;
+            }
+
+            {
+                // A real NPC: talk to it, and report if the gossip still would not open.
                 bot->SetFacingToObject(creature);
                 Event event = Event("", std::to_string(guid.GetCounter()));
-                return ai->DoSpecificAction("gossip hello", event);
+                if (ai->DoSpecificAction("gossip hello", event))
+                    return true;
+
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "could not open a conversation with {} - it may be busy or have nothing for "
+                    "you right now. Try something else", creature->GetName()));
+                return false;
             }
         }
         else if (GameObject* go = ObjectAccessor::GetGameObject(*bot, guid))
@@ -280,23 +340,519 @@ namespace BotBuddyAI
                 
                 bot->GetMotionMaster()->Clear();
                 bot->GetMotionMaster()->MovePoint(0, destX, destY, destZ);
-                return true; // Movement initiated, interaction will happen next cycle
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "too far to use {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                    go->GetGOInfo()->name, distance, interactionDist));
+                return false;
             }
-            
+
             // Check if this is a quest giver game object
             if (go->GetGoType() == GAMEOBJECT_TYPE_QUESTGIVER)
             {
                 return InteractWithQuestGiver(bot, go);
             }
+            else if (go->GetGoType() == GAMEOBJECT_TYPE_CHEST)
+            {
+                // Open and empty the chest directly - the same server-side flow the
+                // client triggers, minus the client. The playerbots "use" action this
+                // used to delegate to is another casualty of ClearStrategies: the bot
+                // stood 5y from Felix's Chest being told it "would not open" while
+                // holding the very quest that unlocks it.
+                bot->SetFacingToObject(go);
+                bot->SendLoot(go->GetGUID(), LOOT_CORPSE);
+
+                Loot* loot = &go->loot;
+                std::vector<std::string> taken;
+                uint32 gold = loot->gold;
+                if (gold)
+                {
+                    bot->ModifyMoney(gold);
+                    loot->gold = 0;
+                    loot->NotifyMoneyRemoved();
+                }
+
+                uint32 maxSlot = loot->GetMaxSlotInLootFor(bot);
+                std::string blocked;
+                for (uint32 slot = 0; slot < maxSlot; ++slot)
+                {
+                    InventoryResult imsg = EQUIP_ERR_OK;
+                    LootItem* item = bot->StoreLootItem(uint8(slot), loot, imsg);
+                    if (item && imsg == EQUIP_ERR_OK)
+                    {
+                        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item->itemid))
+                            taken.push_back(item->count > 1
+                                ? fmt::format("{}x {}", uint32(item->count), proto->Name1)
+                                : proto->Name1);
+                    }
+                    else if (imsg == EQUIP_ERR_INVENTORY_FULL)
+                        blocked = "your bags are full";
+                }
+
+                // Releases the loot window server-side and lets a consumable quest
+                // chest despawn/respawn exactly as it would for a real player.
+                bot->GetSession()->DoLootRelease(go->GetGUID());
+
+                if (taken.empty() && !gold)
+                {
+                    BotBuddy::SetLastOutcome(bot, false, blocked.empty()
+                        ? fmt::format("{} was empty - nothing inside for you", go->GetGOInfo()->name)
+                        : fmt::format("could not take what is in {} - {}", go->GetGOInfo()->name, blocked));
+                    return false;
+                }
+
+                std::string got;
+                for (size_t i = 0; i < taken.size(); ++i)
+                    got += (i ? ", " : "") + taken[i];
+                if (gold)
+                    got += fmt::format("{}{} copper", taken.empty() ? "" : ", ", gold);
+
+                std::string chestOutcome = fmt::format(
+                    "opened {} and took {}", go->GetGOInfo()->name, got);
+                if (std::string worn = EquipUpgradesFromBags(bot); !worn.empty())
+                    chestOutcome += " - and " + worn;
+                BotBuddy::SetLastOutcome(bot, true, chestOutcome);
+                return true;
+            }
             else
             {
-                // Use the bot's AI system to handle interaction with game objects
+                // Levers, gongs, quest gadgets: activate the object directly and let
+                // its own scripts (including quest credit) run.
                 bot->SetFacingToObject(go);
-                Event event = Event("", go->GetGOInfo()->name);
-                return ai->DoSpecificAction("use", event);
+                go->Use(bot);
+                BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                    "used {}", go->GetGOInfo()->name));
+                return true;
             }
         }
+
+        BotBuddy::SetLastOutcome(bot, false,
+            "there is nothing here with that guid - it despawned, or you are too far for it to "
+            "be loaded. Pick a guid from your visible list");
         return false;
+    }
+
+    namespace
+    {
+        Creature* NearestCreatureOfEntry(Player* bot, uint32 entry)
+        {
+            Creature* nearest = nullptr;
+            float best = 0.f;
+            if (!bot->GetMap()) return nullptr;
+            for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+            {
+                Creature* c = pair.second;
+                if (!c || c->GetEntry() != entry || !c->IsAlive()) continue;
+                float d = bot->GetDistance(c);
+                if (!nearest || d < best) { nearest = c; best = d; }
+            }
+            return nearest;
+        }
+
+        GameObject* NearestGameObjectOfEntry(Player* bot, uint32 entry)
+        {
+            GameObject* nearest = nullptr;
+            float best = 0.f;
+            if (!bot->GetMap()) return nullptr;
+            for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
+            {
+                GameObject* go = pair.second;
+                if (!go || go->GetEntry() != entry) continue;
+                float d = bot->GetDistance(go);
+                if (!nearest || d < best) { nearest = go; best = d; }
+            }
+            return nearest;
+        }
+
+        struct ItemSources
+        {
+            std::vector<std::pair<uint32, std::string>> creatures; // entry, name
+            std::vector<std::pair<uint32, std::string>> objects;   // entry, name
+        };
+    }
+
+    // Where a quest item actually comes from on this server. The model's
+    // pretraining "knows" WoW well enough to invent an answer - it decided the
+    // journal was inside a wolf and asked an innkeeper's assistant for it - so
+    // the real answer has to be stated, not left to be guessed. Sources resolve
+    // from the world database once per item and are cached for the server's life.
+    std::string QuestItemSourceHint(Player* bot, uint32 itemId)
+    {
+        static std::mutex cacheMutex;
+        static std::unordered_map<uint32, ItemSources> cache;
+
+        ItemSources const* src = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            auto it = cache.find(itemId);
+            if (it == cache.end())
+            {
+                ItemSources fresh;
+                if (QueryResult r = WorldDatabase.Query(
+                        "SELECT ct.entry, ct.name FROM creature_template ct "
+                        "JOIN creature_loot_template clt ON clt.entry = ct.lootid "
+                        "WHERE clt.item = {} LIMIT 4", itemId))
+                    do { Field* f = r->Fetch(); fresh.creatures.push_back({f[0].Get<uint32>(), f[1].Get<std::string>()}); } while (r->NextRow());
+                if (QueryResult r = WorldDatabase.Query(
+                        "SELECT gt.entry, gt.name FROM gameobject_template gt "
+                        "JOIN gameobject_loot_template glt ON glt.entry = gt.Data1 "
+                        "WHERE gt.type = 3 AND glt.item = {} LIMIT 4", itemId))
+                    do { Field* f = r->Fetch(); fresh.objects.push_back({f[0].Get<uint32>(), f[1].Get<std::string>()}); } while (r->NextRow());
+                it = cache.emplace(itemId, std::move(fresh)).first;
+            }
+            src = &it->second;
+        }
+
+        for (auto const& [entry, name] : src->creatures)
+        {
+            if (Creature* c = NearestCreatureOfEntry(bot, entry))
+                return fmt::format(
+                    "drops from {} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f}) - kill it, then loot it",
+                    name, c->GetGUID().GetCounter(),
+                    c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), bot->GetDistance(c));
+        }
+        for (auto const& [entry, name] : src->objects)
+        {
+            if (GameObject* go = NearestGameObjectOfEntry(bot, entry))
+                return fmt::format(
+                    "found inside {} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f}) - go there and interact with it",
+                    name, go->GetGUID().GetCounter() + GO_GUID_OFFSET,
+                    go->GetPositionX(), go->GetPositionY(), go->GetPositionZ(), bot->GetDistance(go));
+        }
+        if (!src->creatures.empty())
+            return fmt::format("drops from {} - none are near you, travel to find them",
+                               src->creatures.front().second);
+        if (!src->objects.empty())
+            return fmt::format("found inside {} - none are near you, travel to find it",
+                               src->objects.front().second);
+        return "";
+    }
+
+    // Nearest live spawn of a kill objective, so "Kill X: 0/8" comes with a place.
+    std::string QuestKillTargetHint(Player* bot, uint32 creatureEntry)
+    {
+        if (Creature* c = NearestCreatureOfEntry(bot, creatureEntry))
+            return fmt::format("(nearest one: guid {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f})",
+                c->GetGUID().GetCounter(),
+                c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), bot->GetDistance(c));
+        return "(none near you right now - travel to find them)";
+    }
+
+    namespace
+    {
+        std::string FormatMoney(uint32 copper)
+        {
+            uint32 g = copper / 10000, sv = (copper % 10000) / 100, c = copper % 100;
+            std::string out;
+            if (g)  out += fmt::format("{} gold ", g);
+            if (sv) out += fmt::format("{} silver ", sv);
+            if (c || out.empty()) out += fmt::format("{} copper", c);
+            while (!out.empty() && out.back() == ' ') out.pop_back();
+            return out;
+        }
+
+        // Every grey (vendor-trash) item in the bags. Grey quality can never be a
+        // quest item or equipped gear, so selling it is always safe.
+        void CollectGreyItems(Player* bot, std::vector<Item*>& out)
+        {
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    if (it->GetTemplate()->Quality == ITEM_QUALITY_POOR && it->GetTemplate()->SellPrice)
+                        out.push_back(it);
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+                if (Bag* bag = bot->GetBagByPos(bagSlot))
+                    for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                        if (Item* it = bag->GetItemByPos(slot))
+                            if (it->GetTemplate()->Quality == ITEM_QUALITY_POOR && it->GetTemplate()->SellPrice)
+                                out.push_back(it);
+        }
+    }
+
+    namespace
+    {
+        // Quality first, then item level - crude, but monotonic enough for
+        // leveling gear, and it never has to be argued with.
+        uint32 GearScore(ItemTemplate const* proto)
+        {
+            return proto->Quality * 1000 + proto->ItemLevel;
+        }
+
+        void CollectBagWearables(Player* bot, std::vector<Item*>& out)
+        {
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    out.push_back(it);
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+                if (Bag* bag = bot->GetBagByPos(bagSlot))
+                    for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                        if (Item* it = bag->GetItemByPos(slot))
+                            out.push_back(it);
+        }
+    }
+
+    // Wear the best of what is in the bags. Runs after loot, not on a model
+    // decision: comparing two pairs of pants is mechanical optimisation, the same
+    // category as a combat rotation, and burning a 5-second LLM turn on it would
+    // buy nothing but the chance of a wrong answer. Greys are skipped so they
+    // stay sellable, and CanEquipItem is the game's own judgement of usability.
+    std::string EquipUpgradesFromBags(Player* bot)
+    {
+        std::vector<Item*> candidates;
+        CollectBagWearables(bot, candidates);
+
+        std::vector<std::string> equipped;
+        for (Item* it : candidates)
+        {
+            ItemTemplate const* proto = it->GetTemplate();
+            if (!proto || proto->InventoryType == INVTYPE_NON_EQUIP) continue;
+            if (proto->Quality <= ITEM_QUALITY_POOR) continue;   // junk stays junk
+            if (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON) continue;
+
+            uint16 dest = 0;
+            if (bot->CanEquipItem(NULL_SLOT, dest, it, true) != EQUIP_ERR_OK)
+                continue;
+
+            uint8 destSlot = dest & 255;
+            Item* worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, destSlot);
+            if (worn && GearScore(worn->GetTemplate()) >= GearScore(proto))
+                continue;
+
+            std::string replacedNote = worn
+                ? fmt::format(" (replacing {})", worn->GetTemplate()->Name1)
+                : "";
+
+            uint16 src = (uint16(it->GetBagSlot()) << 8) | it->GetSlot();
+            bot->SwapItem(src, dest);
+
+            // Verify it actually landed - SwapItem can refuse (bind prompts, etc.)
+            Item* nowWorn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, destSlot);
+            if (nowWorn && nowWorn->GetEntry() == proto->ItemId)
+                equipped.push_back(proto->Name1 + replacedNote);
+        }
+
+        if (equipped.empty()) return "";
+        std::string out = "equipped ";
+        for (size_t i = 0; i < equipped.size(); ++i)
+            out += (i ? ", " : "") + equipped[i];
+        return out;
+    }
+
+    // One compact paragraph of bag state for the prompt. Without it the model has
+    // no idea what it is carrying: loot outcomes scroll out of the history window
+    // and the items effectively stop existing, so bags silently fill with vendor
+    // trash it has no reason to ever sell.
+    std::string BagSummary(Player* bot)
+    {
+        uint32 total = 0, used = 0;
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+            ++total;
+            if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot)) ++used;
+        }
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            if (Bag* bag = bot->GetBagByPos(bagSlot))
+            {
+                total += bag->GetBagSize();
+                used  += bag->GetBagSize() - bag->GetFreeSlots();
+            }
+
+        std::string out = fmt::format("Your bags: {}/{} slots used. Money: {}.\n",
+                                      used, total, FormatMoney(bot->GetMoney()));
+
+        std::vector<Item*> grey;
+        CollectGreyItems(bot, grey);
+        if (!grey.empty())
+        {
+            std::unordered_map<uint32, uint32> counts;
+            std::unordered_map<uint32, ItemTemplate const*> protos;
+            uint32 value = 0;
+            for (Item* it : grey)
+            {
+                counts[it->GetEntry()] += it->GetCount();
+                protos[it->GetEntry()] = it->GetTemplate();
+                value += it->GetTemplate()->SellPrice * it->GetCount();
+            }
+            out += "Grey junk you could sell";
+            bool first = true;
+            for (auto const& [entry, n] : counts)
+            {
+                out += first ? ": " : ", ";
+                first = false;
+                out += n > 1 ? fmt::format("{}x {}", n, protos[entry]->Name1)
+                             : protos[entry]->Name1;
+            }
+            out += fmt::format(" - worth {} at any [VENDOR] (use sell_junk)\n", FormatMoney(value));
+        }
+        return out;
+    }
+
+    // Sell every grey item to a vendor the bot is standing next to.
+    bool SellJunk(Player* bot, uint32 lowGuid)
+    {
+        if (!bot || !bot->GetMap()) return false;
+
+        Creature* vendor = nullptr;
+        for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+            if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
+                { vendor = pair.second; break; }
+
+        if (!vendor || !vendor->IsAlive())
+        {
+            BotBuddy::SetLastOutcome(bot, false,
+                "no vendor with that guid is here - pick one marked [VENDOR] from your visible list");
+            return false;
+        }
+        if (!vendor->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is not a vendor and buys nothing - find someone marked [VENDOR]",
+                vendor->GetName()));
+            return false;
+        }
+        float dist = bot->GetDistance(vendor);
+        if (dist > INTERACTION_DISTANCE)
+        {
+            float angle = vendor->GetAngle(bot);
+            bot->GetMotionMaster()->Clear();
+            bot->GetMotionMaster()->MovePoint(0,
+                vendor->GetPositionX() + cos(angle + M_PI) * 3.0f,
+                vendor->GetPositionY() + sin(angle + M_PI) * 3.0f,
+                vendor->GetPositionZ());
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far to trade with {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                vendor->GetName(), dist, (float)INTERACTION_DISTANCE));
+            return false;
+        }
+
+        std::vector<Item*> grey;
+        CollectGreyItems(bot, grey);
+        if (grey.empty())
+        {
+            BotBuddy::SetLastOutcome(bot, false,
+                "you have no grey junk to sell - your bags hold only things worth keeping");
+            return false;
+        }
+
+        uint32 earned = 0, sold = 0;
+        for (Item* it : grey)
+        {
+            earned += it->GetTemplate()->SellPrice * it->GetCount();
+            sold   += it->GetCount();
+            bot->MoveItemFromInventory(it->GetBagSlot(), it->GetSlot(), true);
+            it->DestroyForPlayer(bot);
+        }
+        bot->ModifyMoney(int32(earned));
+
+        BotBuddy::SetLastOutcome(bot, true, fmt::format(
+            "sold {} pieces of junk to {} for {}. You now have {}",
+            sold, vendor->GetName(), FormatMoney(earned), FormatMoney(bot->GetMoney())));
+
+        if (g_EnableOllamaBotBuddyDebug)
+            LOG_INFO("server.loading", "[OllamaBotBuddy] {} sold {} items for {} copper",
+                bot->GetName(), sold, earned);
+        return true;
+    }
+
+    // Who takes this quest when it is done, and where they are right now. The
+    // quest log tells the bot a quest is READY TO TURN IN but not to whom - and a
+    // model with no name to anchor on invents one from its pretraining ("move
+    // toward the quest giver Farmer Saldean", in Coldridge Valley). Hand it the
+    // real ender, with a guid and coordinates it can put straight into
+    // move_to_target.
+    std::string QuestEnderHint(Player* bot, uint32 questId)
+    {
+        // No reverse index exists for quest -> ender, so walk the forward map.
+        uint32 enderEntry = 0;
+        for (auto const& rel : *sObjectMgr->GetCreatureQuestInvolvedRelationMap())
+            if (rel.second == questId) { enderEntry = rel.first; break; }
+
+        if (enderEntry)
+        {
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(enderEntry);
+            std::string name = tmpl ? tmpl->Name : "an NPC";
+
+            // Find the closest live spawn so the model gets a place, not just a name.
+            if (Creature* nearest = NearestCreatureOfEntry(bot, enderEntry))
+                return fmt::format(
+                    "{} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f})",
+                    name, nearest->GetGUID().GetCounter(),
+                    nearest->GetPositionX(), nearest->GetPositionY(), nearest->GetPositionZ(),
+                    bot->GetDistance(nearest));
+            return name + " (not in this area - travel to find them)";
+        }
+
+        for (auto const& rel : *sObjectMgr->GetGOQuestInvolvedRelationMap())
+            if (rel.second == questId)
+            {
+                GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(rel.first);
+                return tmpl ? tmpl->name : "an object";
+            }
+
+        return "";
+    }
+
+    // A quest giver whose quest you already hold, and have not finished, offers
+    // nothing when you talk to it. Returning a bare false there sends the model
+    // straight back to the same NPC - it talked to Sten Stoutarm 45 times in a row.
+    // Name the quest and the objective that is short.
+    std::string NothingToDoWithQuestGiver(Player* bot, WorldObject* questGiver)
+    {
+        // A quest that is done but not handed in is the loudest signal here: the
+        // model is usually at the wrong NPC trying to turn it in. Say who takes it.
+        for (auto const& qs : bot->getQuestStatusMap())
+        {
+            if (qs.second.Status != QUEST_STATUS_COMPLETE || bot->GetQuestRewardStatus(qs.first)) continue;
+
+            Quest const* quest = sObjectMgr->GetQuestTemplate(qs.first);
+            if (!quest) continue;
+
+            std::string ender = QuestEnderHint(bot, qs.first);
+            if (!ender.empty())
+                return fmt::format(
+                    "{} does not take \"{}\" - hand it in to {} instead. Use move_to_target "
+                    "with that guid to walk there, then interact",
+                    questGiver->GetName(), quest->GetTitle(), ender);
+        }
+
+        for (auto const& qs : bot->getQuestStatusMap())
+        {
+            if (qs.second.Status != QUEST_STATUS_INCOMPLETE) continue;
+
+            Quest const* quest = sObjectMgr->GetQuestTemplate(qs.first);
+            if (!quest) continue;
+
+            for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+            {
+                if (uint32 itemId = quest->RequiredItemId[i])
+                {
+                    uint32 have = bot->GetItemCount(itemId, true);
+                    uint32 need = quest->RequiredItemCount[i];
+                    if (have >= need) continue;
+
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+                    return fmt::format(
+                        "{} has nothing for you - you already have \"{}\" and it is not finished. "
+                        "You still need {} more {}. Go and get them, then come back",
+                        questGiver->GetName(), quest->GetTitle(), need - have,
+                        proto ? proto->Name1 : "of the quest item");
+                }
+
+                if (quest->RequiredNpcOrGo[i] > 0)
+                {
+                    uint32 have = bot->GetReqKillOrCastCurrentCount(qs.first, quest->RequiredNpcOrGo[i]);
+                    uint32 need = quest->RequiredNpcOrGoCount[i];
+                    if (have >= need) continue;
+
+                    return fmt::format(
+                        "{} has nothing for you - you already have \"{}\" and it is not finished. "
+                        "You still need {} more. Go and do that, then come back",
+                        questGiver->GetName(), quest->GetTitle(), need - have);
+                }
+            }
+        }
+
+        return fmt::format(
+            "{} has no quest for you right now - nothing to take and nothing to hand in. "
+            "Go and do something else", questGiver->GetName());
     }
 
     bool InteractWithQuestGiver(Player* bot, WorldObject* questGiver)
@@ -307,8 +863,12 @@ namespace BotBuddyAI
         if (!ai) return false;
 
         // Check interaction distance
-        if (bot->GetDistance(questGiver) > INTERACTION_DISTANCE)
+        float qgDist = bot->GetDistance(questGiver);
+        if (qgDist > INTERACTION_DISTANCE)
         {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far to talk to {} ({:.1f}y away, need {:.1f}y) - move closer first",
+                questGiver->GetName(), qgDist, (float)INTERACTION_DISTANCE));
             return false;
         }
 
@@ -322,9 +882,15 @@ namespace BotBuddyAI
         bot->PrepareQuestMenu(guid);
         QuestMenu& questMenu = bot->PlayerTalkClass->GetQuestMenu();
 
-        bool foundQuestAction = false;
+        // Turn in what is finished, take what is offered - and keep the results,
+        // because the caller's word is what the model hears. The old code discarded
+        // both return values and reported success either way, so a failed accept
+        // looked identical to a real one and the bot re-talked to the same NPC
+        // 49 times, "succeeding" every time while its quest log stayed empty.
+        std::vector<std::string> turnedIn;
+        std::vector<std::string> accepted;
+        std::vector<std::string> healed;
 
-        // Process all available quest menu items
         for (uint32 i = 0; i < questMenu.GetMenuItemCount(); ++i)
         {
             QuestMenuItem const& menuItem = questMenu.GetItem(i);
@@ -332,38 +898,54 @@ namespace BotBuddyAI
             if (!quest) continue;
 
             QuestStatus status = bot->GetQuestStatus(menuItem.QuestId);
-            
-            // Handle completed quests first (highest priority)
+
             if (status == QUEST_STATUS_COMPLETE && bot->CanRewardQuest(quest, false))
             {
-                // Turn in the quest using the playerbot action system
-                TurnInQuest(bot, menuItem.QuestId);
-                foundQuestAction = true;
-                
-                if (g_EnableOllamaBotBuddyDebug)
-                {
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} turning in quest {}: {}", 
-                        bot->GetName(), menuItem.QuestId, quest->GetTitle());
-                }
+                if (TurnInQuest(bot, menuItem.QuestId))
+                    turnedIn.push_back(quest->GetTitle());
             }
-            // Handle new quests that can be accepted
             else if (status == QUEST_STATUS_NONE && bot->CanTakeQuest(quest, false) && bot->CanAddQuest(quest, false))
             {
-                // Accept the quest using the playerbot action system
-                AcceptQuest(bot, menuItem.QuestId);
-                foundQuestAction = true;
-                
-                if (g_EnableOllamaBotBuddyDebug)
+                if (AcceptQuest(bot, menuItem.QuestId))
+                    accepted.push_back(quest->GetTitle());
+            }
+            else if (status == QUEST_STATUS_INCOMPLETE)
+            {
+                // Replace a lost delivery item while we are standing at the one NPC
+                // who could hand it out (see AcceptQuest for how it goes missing).
+                uint32 srcItem = quest->GetSrcItemId();
+                if (srcItem &&
+                    !bot->HasItemCount(srcItem, std::max<uint32>(1, quest->GetSrcItemCount())) &&
+                    bot->GiveQuestSourceItem(quest))
                 {
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} accepting quest {}: {}", 
-                        bot->GetName(), menuItem.QuestId, quest->GetTitle());
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(srcItem);
+                    healed.push_back(fmt::format("{} for \"{}\"",
+                        proto ? proto->Name1 : "the quest item", quest->GetTitle()));
                 }
             }
         }
 
-        // If we found quest actions, return success
-        if (foundQuestAction)
+        if (!turnedIn.empty() || !accepted.empty() || !healed.empty())
         {
+            auto join = [](std::vector<std::string> const& v)
+            {
+                std::string out;
+                for (size_t i = 0; i < v.size(); ++i)
+                    out += (i ? "\", \"" : "\"") + v[i];
+                return out + "\"";
+            };
+
+            std::string summary;
+            if (!turnedIn.empty())
+                summary += fmt::format("turned in {}", join(turnedIn));
+            if (!accepted.empty())
+                summary += fmt::format("{}accepted {} - check your active quests for what it needs",
+                                       turnedIn.empty() ? "" : "; ", join(accepted));
+            for (auto const& h : healed)
+                summary += fmt::format("{}your missing {} has been replaced - deliver it as the quest says",
+                                       summary.empty() ? "" : "; ", h);
+
+            BotBuddy::SetLastOutcome(bot, true, summary);
             return true;
         }
 
@@ -376,17 +958,25 @@ namespace BotBuddyAI
                 return true;
             }
             
-            // Fallback to basic gossip hello action
-            Event event = Event("", std::to_string(guid.GetCounter()));
-            return ai->DoSpecificAction("gossip hello", event);
+            // Nothing to hand in and nothing to take. Opening the gossip window
+            // anyway would count as a success and teach the model to keep coming
+            // back - the exact loop this path exists to break. Report why the
+            // visit achieved nothing instead.
+            BotBuddy::SetLastOutcome(bot, false, NothingToDoWithQuestGiver(bot, questGiver));
+            return false;
         }
         else if (GameObject* go = questGiver->ToGameObject())
         {
             // Use game object interaction
             Event event = Event("", go->GetGOInfo()->name);
-            return ai->DoSpecificAction("use", event);
+            if (ai->DoSpecificAction("use", event))
+                return true;
+
+            BotBuddy::SetLastOutcome(bot, false, NothingToDoWithQuestGiver(bot, questGiver));
+            return false;
         }
 
+        BotBuddy::SetLastOutcome(bot, false, NothingToDoWithQuestGiver(bot, questGiver));
         return false;
     }
 
@@ -419,13 +1009,13 @@ namespace BotBuddyAI
             
             if (status == QUEST_STATUS_COMPLETE && bot->CanRewardQuest(quest, false))
             {
-                TurnInQuest(bot, menuItem.QuestId);
-                return true;
+                // Propagate the real result - claiming success for a failed turn-in
+                // is how the model ends up talking to the same NPC forever.
+                return TurnInQuest(bot, menuItem.QuestId);
             }
             else if (status == QUEST_STATUS_NONE && bot->CanTakeQuest(quest, false) && bot->CanAddQuest(quest, false))
             {
-                AcceptQuest(bot, menuItem.QuestId);
-                return true;
+                return AcceptQuest(bot, menuItem.QuestId);
             }
         }
 
@@ -528,65 +1118,122 @@ namespace BotBuddyAI
         return false;
     }
 
+    // Cast an ability directly through the core.
+    //
+    // The old version delegated to playerbots actions by spell name - the same
+    // pattern that made loot and quest accept structurally dead under
+    // ClearStrategies(). Casting through Unit::CastSpell returns a SpellCastResult,
+    // so every refusal the game engine has can be translated into an outcome the
+    // model can act on.
     bool CastSpell(Player* bot, uint32 spellId, Unit* target)
     {
         if (!bot) return false;
-        
-        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (!ai) return false;
-        
+
         SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
-        if (!spellInfo) return false;
-        
-        // Set the target in the AI context if provided
-        if (target) {
-            ai->GetAiObjectContext()->GetValue<Unit*>("current target")->Set(target);
-            
-            // Check range requirements for the spell
-            float spellRange = spellInfo->GetMaxRange(false);
-            float currentDistance = bot->GetDistance(target);
-            bool isMeleeSpell = spellRange <= ATTACK_DISTANCE;
-            
-            if (g_EnableOllamaBotBuddyDebug) {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Casting spell {} on target at distance {:.1f}, spell range: {:.1f}", 
-                    spellInfo->SpellName[0], currentDistance, spellRange);
+        if (!spellInfo)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "no spell with id {} exists - use an ID from your known spells list", spellId));
+            return false;
+        }
+        std::string name = (spellInfo->SpellName[0] && *spellInfo->SpellName[0])
+            ? spellInfo->SpellName[0] : fmt::format("spell {}", spellId);
+
+        if (!bot->HasSpell(spellId))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you do not know {} - only use IDs from your known spells list", name));
+            return false;
+        }
+        if (bot->HasSpellCooldown(spellId))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is still on cooldown - do something else while it recovers", name));
+            return false;
+        }
+
+        if (!target) target = bot;
+
+        if (target != bot)
+        {
+            // Close the distance first if the ability cannot reach.
+            float maxRange = spellInfo->GetMaxRange(false, bot);
+            if (maxRange <= 0.f) maxRange = 5.0f; // melee ability
+            float dist = bot->GetDistance(target);
+            if (dist > maxRange)
+            {
+                bot->GetMotionMaster()->Clear();
+                bot->GetMotionMaster()->MoveChase(target->ToUnit(), 0.0f);
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "too far to hit {} with {} ({:.1f}y away, reaches {:.1f}y) - walking closer, retry when adjacent",
+                    target->GetName(), name, dist, maxRange));
+                return false;
             }
-            
-            // Handle positioning for spell casting
-            Event moveEvent = Event("", "");
-            if (isMeleeSpell && !bot->IsWithinMeleeRange(target)) {
-                // Need to get into melee range for melee spells
-                ai->DoSpecificAction("reach melee", moveEvent);
-            } else if (!isMeleeSpell && currentDistance > spellRange) {
-                // Need to get into spell range for ranged spells
-                ai->DoSpecificAction("reach spell", moveEvent);
-            } else if (!isMeleeSpell && currentDistance < 5.0f && ai->IsRanged(bot)) {
-                // Ranged character too close - back away for better positioning
-                ai->DoSpecificAction("flee", moveEvent);
+            bot->SetFacingToObject(target);
+        }
+
+        SpellCastResult res = bot->CastSpell(target, spellId, false);
+        if (res == SPELL_CAST_OK)
+        {
+            BotBuddy::SetLastOutcome(bot, true, target == bot
+                ? fmt::format("cast {}", name)
+                : fmt::format("hit {} with {}", target->GetName(), name));
+            if (g_EnableOllamaBotBuddyDebug)
+                LOG_INFO("server.loading", "[OllamaBotBuddy] {} cast {} on {}",
+                    bot->GetName(), name, target->GetName());
+            return true;
+        }
+
+        std::string why;
+        switch (res)
+        {
+            case SPELL_FAILED_NO_COMBO_POINTS:
+                why = fmt::format("{} spends combo points and you have none on this target - "
+                                  "build them first with your combo-generating strike", name);
+                break;
+            case SPELL_FAILED_NO_POWER:
+            {
+                char const* power = "energy";
+                switch (spellInfo->PowerType)
+                {
+                    case POWER_MANA: power = "mana"; break;
+                    case POWER_RAGE: power = "rage"; break;
+                    case POWER_ENERGY: power = "energy"; break;
+                    default: break;
+                }
+                why = fmt::format("not enough {} for {} right now - keep attacking and try again shortly",
+                                  power, name);
+                break;
             }
+            case SPELL_FAILED_OUT_OF_RANGE:
+                why = fmt::format("{} is out of range of {} - move closer", target->GetName(), name);
+                break;
+            case SPELL_FAILED_LINE_OF_SIGHT:
+                why = fmt::format("you cannot see {} from here - something is in the way", target->GetName());
+                break;
+            case SPELL_FAILED_NOT_READY:
+                why = fmt::format("{} is not ready yet - do something else this turn", name);
+                break;
+            case SPELL_FAILED_NOT_BEHIND:
+                why = fmt::format("{} only works from behind the target - move behind it first", name);
+                break;
+            case SPELL_FAILED_BAD_TARGETS:
+            case SPELL_FAILED_TARGET_FRIENDLY:
+            case SPELL_FAILED_TARGETS_DEAD:
+                why = fmt::format("{} cannot be used on {} - pick a valid target for it",
+                                  name, target->GetName());
+                break;
+            case SPELL_FAILED_CASTER_AURASTATE:
+            case SPELL_FAILED_ONLY_STEALTHED:
+                why = fmt::format("{} cannot be used in your current state (it may require stealth "
+                                  "or another condition you do not meet)", name);
+                break;
+            default:
+                why = fmt::format("could not cast {} (engine refusal code {})", name, int(res));
+                break;
         }
-        
-        // Use the spell name directly as the action
-        const char* spellName = spellInfo->SpellName[0];
-        if (!spellName || !*spellName) return false;
-        
-        Event event = Event("", "");
-        bool result = ai->DoSpecificAction(spellName, event);
-        
-        // If spell casting by name fails, try using spell ID
-        if (!result && target) {
-            // Try alternative approaches
-            std::string spellIdStr = std::to_string(spellId);
-            event = Event("", spellIdStr);
-            result = ai->DoSpecificAction("cast", event);
-        }
-        
-        if (g_EnableOllamaBotBuddyDebug) {
-            LOG_INFO("server.loading", "[OllamaBotBuddy] Spell cast result for {}: {}", 
-                spellName, result ? "SUCCESS" : "FAILED");
-        }
-        
-        return result;
+        BotBuddy::SetLastOutcome(bot, false, why);
+        return false;
     }
 
     bool Say(Player* bot, const std::string& msg)
@@ -625,19 +1272,113 @@ namespace BotBuddyAI
         return ai->DoSpecificAction("stay", event);
     }
 
+    // Accept a quest directly.
+    //
+    // The playerbots "accept quest" action cannot be used here: its Execute starts
+    // with `requester = event.getOwner() ?: GetMaster()` and returns false when both
+    // are null - and an autonomous bot has neither. Every call from this harness
+    // failed on that line before doing anything, while the caller reported success.
     bool AcceptQuest(Player* bot, uint32 questId)
     {
-        if (!bot) return false;
-        
-        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (!ai) return false;
-        
-        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        if (!quest) return false;
+        if (!bot || !bot->GetMap()) return false;
 
-        // Use the playerbot AI system to handle quest acceptance
-        Event event = Event("", std::to_string(questId));
-        return ai->DoSpecificAction("accept quest", event);
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "there is no quest with id {} - use a quest id you were shown", questId));
+            return false;
+        }
+
+        QuestStatus status = bot->GetQuestStatus(questId);
+        if (status != QUEST_STATUS_NONE)
+        {
+            // Self-heal a lost delivery item. A crash between saves can leave the
+            // quest in the log with its source item gone - unfinishable, since the
+            // item only exists at accept time and the bot has no abandon verb. If
+            // the giver is willing to hand the quest out, it can hand the parcel
+            // out again too.
+            uint32 srcItem = quest->GetSrcItemId();
+            if (srcItem && status == QUEST_STATUS_INCOMPLETE &&
+                !bot->HasItemCount(srcItem, std::max<uint32>(1, quest->GetSrcItemCount())) &&
+                bot->GiveQuestSourceItem(quest))
+            {
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(srcItem);
+                BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                    "you already have \"{}\" - and your missing {} has been replaced. "
+                    "Deliver it as the quest says",
+                    quest->GetTitle(), proto ? proto->Name1 : "quest item"));
+                return true;
+            }
+
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you already have \"{}\" in your log - no need to accept it again",
+                quest->GetTitle()));
+            return false;
+        }
+
+        // The quest giver must actually be here and close enough.
+        Object* giver = nullptr;
+        std::string giverName;
+        float giverDist = 0.f;
+        for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+        {
+            Creature* c = pair.second;
+            if (!c || !c->IsAlive() || !c->hasQuest(questId)) continue;
+            float d = bot->GetDistance(c);
+            if (!giver || d < giverDist) { giver = c; giverName = c->GetName(); giverDist = d; }
+        }
+        if (!giver)
+        {
+            for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
+            {
+                GameObject* go = pair.second;
+                if (!go || !go->hasQuest(questId)) continue;
+                float d = bot->GetDistance(go);
+                if (!giver || d < giverDist) { giver = go; giverName = go->GetName(); giverDist = d; }
+            }
+        }
+
+        if (!giver)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "nobody around here offers \"{}\" - find the right quest giver first",
+                quest->GetTitle()));
+            return false;
+        }
+        if (giverDist > INTERACTION_DISTANCE)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far from {} to take \"{}\" ({:.1f}y away, need {:.1f}y) - move to them first",
+                giverName, quest->GetTitle(), giverDist, (float)INTERACTION_DISTANCE));
+            return false;
+        }
+
+        if (!bot->CanAddQuest(quest, false))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "cannot take \"{}\" - your quest log is full. Finish or abandon something first",
+                quest->GetTitle()));
+            return false;
+        }
+        if (!bot->CanTakeQuest(quest, false))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you do not qualify for \"{}\" right now", quest->GetTitle()));
+            return false;
+        }
+
+        bot->AddQuestAndCheckCompletion(quest, giver);
+
+        BotBuddy::SetLastOutcome(bot, true, fmt::format(
+            "accepted \"{}\" from {} - check your active quests for what it needs",
+            quest->GetTitle(), giverName));
+
+        if (g_EnableOllamaBotBuddyDebug)
+            LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} accepted quest {}: {}",
+                bot->GetName(), questId, quest->GetTitle());
+
+        return true;
     }
 
     bool TurnInQuest(Player* bot, uint32 questId)
@@ -651,23 +1392,26 @@ namespace BotBuddyAI
         if (!quest) return false;
 
         // Check if quest is ready to turn in
-        if (bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE || bot->GetQuestRewardStatus(questId))
+        if (bot->GetQuestRewardStatus(questId))
         {
-            if (g_EnableOllamaBotBuddyDebug)
-            {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} cannot turn in quest {}: status={}, already rewarded={}", 
-                    bot->GetName(), questId, bot->GetQuestStatus(questId), bot->GetQuestRewardStatus(questId));
-            }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "you already turned \"{}\" in - it is done. Do something else",
+                quest->GetTitle()));
+            return false;
+        }
+        if (bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "\"{}\" is not finished yet - complete its objectives before turning it in",
+                quest->GetTitle()));
             return false;
         }
         
         if (!bot->CanRewardQuest(quest, false))
         {
-            if (g_EnableOllamaBotBuddyDebug)
-            {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} cannot reward quest {}: requirements not met", 
-                    bot->GetName(), questId);
-            }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "cannot turn \"{}\" in yet - a requirement is still missing (an item to hand "
+                "over, or bag space for the reward)", quest->GetTitle()));
             return false;
         }
         
@@ -703,11 +1447,9 @@ namespace BotBuddyAI
         
         if (!questGiverGuid)
         {
-            if (g_EnableOllamaBotBuddyDebug)
-            {
-                LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} cannot find quest giver for quest {}", 
-                    bot->GetName(), questId);
-            }
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "nobody close enough takes \"{}\" - walk to the NPC the quest says to return "
+                "to, then turn it in", quest->GetTitle()));
             return false;
         }
         
@@ -742,6 +1484,14 @@ namespace BotBuddyAI
         rewardPacket.rpos(0);
         bot->GetSession()->HandleQuestgiverChooseRewardOpcode(rewardPacket);
         
+        std::string rewardNote;
+        if (quest->GetRewChoiceItemsCount() > 0 && quest->RewardChoiceItemId[rewardIndex])
+            if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(quest->RewardChoiceItemId[rewardIndex]))
+                rewardNote = fmt::format(", taking {} as the reward", proto->Name1);
+
+        BotBuddy::SetLastOutcome(bot, true, fmt::format(
+            "turned in \"{}\"{}", quest->GetTitle(), rewardNote));
+
         if (g_EnableOllamaBotBuddyDebug)
         {
             LOG_INFO("server.loading", "[OllamaBotBuddy] Bot {} turned in quest {}: {} with reward index {}", 
@@ -751,16 +1501,189 @@ namespace BotBuddyAI
         return true;
     }
 
-    bool LootNearby(Player* bot)
+    namespace
     {
-        if (!bot) return false;
+        // A corpse this bot is allowed to loot: dead, flagged lootable, and either
+        // tagged by us or by our group.
+        bool BotMayLoot(Player* bot, Creature* c)
+        {
+            if (!c || !c->isDead()) return false;
+            if (!c->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE)) return false;
+            if (!c->hasLootRecipient()) return false;
+            if (c->GetLootRecipient() == bot) return true;
+            return c->GetLootRecipientGroup() && bot->GetGroup() == c->GetLootRecipientGroup();
+        }
 
-        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (!ai) return false;
+        Creature* NearestLootableCorpse(Player* bot, float radius)
+        {
+            Creature* best = nullptr;
+            float bestDist = radius;
+            for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+            {
+                Creature* c = pair.second;
+                if (!BotMayLoot(bot, c)) continue;
+                float d = bot->GetDistance(c);
+                if (d <= bestDist) { bestDist = d; best = c; }
+            }
+            return best;
+        }
+    }
 
-        // Use the bot's AI system to handle looting
-        Event event = Event("", "");
-        return ai->DoSpecificAction("loot", event);
+    // Loot a corpse outright.
+    //
+    // The classic playerbots "loot" action cannot be used here: it is gated on the
+    // LootObjectStack, which is only filled by AddLootAction under the loot strategy -
+    // and the LLM harness calls ClearStrategies() on every engine, so that stack is
+    // permanently empty and the action returns false forever. Likewise StoreLootAction
+    // is a packet handler registered by that same strategy, so even a CMSG_LOOT would
+    // never store anything. We therefore drain the corpse directly, which is also
+    // synchronous - we know what was picked up and can say so in the outcome.
+    bool LootCorpse(Player* bot, uint32 lowGuid)
+    {
+        if (!bot || !bot->GetMap()) return false;
+
+        Creature* corpse = nullptr;
+        if (lowGuid)
+        {
+            // Resolve the low guid the model saw in its visible list. ObjectGuid::Create
+            // needs the creature entry too, which the model has no way to know, so scan.
+            for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
+                    { corpse = pair.second; break; }
+            if (!corpse)
+            {
+                BotBuddy::SetLastOutcome(bot, false,
+                    "nothing with that guid is here any more - it despawned; pick a target from your visible list");
+                return false;
+            }
+            if (corpse->IsAlive())
+            {
+                BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                    "{} is alive ({}/{} hp), not a corpse - kill it before looting it",
+                    corpse->GetName(), corpse->GetHealth(), corpse->GetMaxHealth()));
+                return false;
+            }
+        }
+        else
+        {
+            // No target named: fall back to the nearest corpse we own.
+            corpse = NearestLootableCorpse(bot, 30.0f);
+            if (!corpse)
+            {
+                BotBuddy::SetLastOutcome(bot, false,
+                    "there is no corpse near you that you can loot - you only get loot from things you killed yourself, "
+                    "and only while they are still marked DEAD (LOOTABLE) in your visible list");
+                return false;
+            }
+        }
+
+        float distance = bot->GetDistance(corpse);
+        if (distance > INTERACTION_DISTANCE)
+        {
+            float angle = corpse->GetAngle(bot);
+            bot->GetMotionMaster()->Clear();
+            bot->GetMotionMaster()->MovePoint(0,
+                corpse->GetPositionX() + cos(angle + M_PI) * 2.0f,
+                corpse->GetPositionY() + sin(angle + M_PI) * 2.0f,
+                corpse->GetPositionZ());
+
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "too far to loot {} ({:.1f}y away, need {:.1f}y) - walking closer, retry when adjacent",
+                corpse->GetName(), distance, (float)INTERACTION_DISTANCE));
+            return false;
+        }
+
+        if (!corpse->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} has nothing left on it - it is already looted. Stop looting it and do something else",
+                corpse->GetName()));
+            return false;
+        }
+
+        if (!BotMayLoot(bot, corpse))
+        {
+            BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                "{} is not yours to loot - somebody else killed it. Kill your own targets to get loot",
+                corpse->GetName()));
+            return false;
+        }
+
+        if (bot->IsMounted()) bot->Dismount();
+        if (bot->isMoving())  bot->StopMoving();
+
+        Loot* loot = &corpse->loot;
+        bot->SetLootGUID(corpse->GetGUID());
+        loot->FillNotNormalLootFor(bot);
+        loot->AddLooter(bot->GetGUID());
+
+        std::vector<std::string> taken;
+        uint32 gold = loot->gold;
+
+        if (gold)
+        {
+            bot->ModifyMoney(gold);
+            loot->gold = 0;
+            loot->NotifyMoneyRemoved();
+        }
+
+        // GetMaxSlotInLootFor covers the normal items plus this player's quest/FFA/
+        // conditional lists, so quest drops are picked up like anything else.
+        uint32 maxSlot = loot->GetMaxSlotInLootFor(bot);
+        std::string blocked;
+        for (uint32 slot = 0; slot < maxSlot; ++slot)
+        {
+            InventoryResult msg = EQUIP_ERR_OK;
+            LootItem* item = bot->StoreLootItem(uint8(slot), loot, msg);
+            if (item && msg == EQUIP_ERR_OK)
+            {
+                if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item->itemid))
+                    taken.push_back(item->count > 1
+                        ? fmt::format("{}x {}", uint32(item->count), proto->Name1)
+                        : proto->Name1);
+            }
+            else if (msg == EQUIP_ERR_INVENTORY_FULL)
+            {
+                blocked = "your bags are full";
+            }
+        }
+
+        bot->SetLootGUID(ObjectGuid::Empty);
+        loot->RemoveLooter(bot->GetGUID());
+
+        // Same teardown the core does in WorldSession::DoLootRelease, so the corpse
+        // stops advertising loot, decays on the looted timer, and turns skinnable.
+        if (loot->isLooted())
+        {
+            corpse->AllLootRemovedFromCorpse();
+            corpse->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);
+            loot->clear();
+        }
+
+        if (taken.empty() && !gold)
+        {
+            BotBuddy::SetLastOutcome(bot, false, blocked.empty()
+                ? fmt::format("{} had nothing you could take", corpse->GetName())
+                : fmt::format("could not loot {} - {}", corpse->GetName(), blocked));
+            return false;
+        }
+
+        std::string got;
+        for (size_t i = 0; i < taken.size(); ++i)
+            got += (i ? ", " : "") + taken[i];
+        if (gold)
+            got += fmt::format("{}{} copper", taken.empty() ? "" : ", ", gold);
+
+        std::string outcomeText = fmt::format("looted {} from {}", got, corpse->GetName());
+        if (std::string worn = EquipUpgradesFromBags(bot); !worn.empty())
+            outcomeText += " - and " + worn;
+        BotBuddy::SetLastOutcome(bot, true, outcomeText);
+
+        if (g_EnableOllamaBotBuddyDebug)
+            LOG_INFO("server.loading", "[OllamaBotBuddy] {} looted {} from {}",
+                bot->GetName(), got, corpse->GetName());
+
+        return true;
     }
 
 } // namespace BotBuddyAI
@@ -829,6 +1752,55 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                 return false;
             }
             break;
+        case BotControlCommandType::MoveToTarget:
+            if (!command.args.empty())
+            {
+                uint32 lowGuid = 0;
+                try { lowGuid = std::stoul(command.args[0]); }
+                catch (...) { return false; }
+
+                WorldObject* target = nullptr;
+                if (lowGuid >= GO_GUID_OFFSET)
+                {
+                    uint32 goGuid = lowGuid - GO_GUID_OFFSET;
+                    for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
+                        if (pair.second && pair.second->GetGUID().GetCounter() == goGuid)
+                            { target = pair.second; break; }
+                }
+                else
+                {
+                    for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                        if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
+                            { target = pair.second; break; }
+                }
+
+                if (!target)
+                {
+                    BotBuddy::SetLastOutcome(bot, false, "no such target in this area");
+                    return false;
+                }
+
+                float dist = bot->GetDistance(target);
+                if (dist <= INTERACTION_DISTANCE)
+                {
+                    BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                        "already next to {} ({:.1f}y) - you can interact or attack now",
+                        target->GetName(), dist));
+                    return true;
+                }
+
+                // Stand just inside interaction range on the near side of the target.
+                float angle = target->GetAngle(bot);
+                float destX = target->GetPositionX() + cos(angle) * 3.0f;
+                float destY = target->GetPositionY() + sin(angle) * 3.0f;
+                float destZ = target->GetPositionZ();
+                bot->GetMotionMaster()->Clear();
+                bot->GetMotionMaster()->MovePoint(0, destX, destY, destZ);
+                BotBuddy::SetLastOutcome(bot, true, fmt::format(
+                    "walking to {} ({:.1f}y away)", target->GetName(), dist));
+                return true;
+            }
+            break;
         case BotControlCommandType::Interact:
             if (!command.args.empty())
             {
@@ -845,33 +1817,27 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                 Creature* creatureTarget = nullptr;
                 GameObject* goTarget = nullptr;
 
-                // Find creature by LowGuid
-                for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                if (lowGuid >= GO_GUID_OFFSET)
                 {
-                    Creature* c = pair.second;
-                    if (!c) continue;
-                    if (c->GetGUID().GetCounter() == lowGuid)
+                    uint32 goGuid = lowGuid - GO_GUID_OFFSET;
+                    for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
                     {
-                        creatureTarget = c;
-                        break;
+                        GameObject* go = pair.second;
+                        if (go && go->GetGUID().GetCounter() == goGuid) { goTarget = go; break; }
+                    }
+                }
+                else
+                {
+                    for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                    {
+                        Creature* c = pair.second;
+                        if (c && c->GetGUID().GetCounter() == lowGuid) { creatureTarget = c; break; }
                     }
                 }
 
                 if (creatureTarget)
                 {
                     return BotBuddyAI::Interact(bot, creatureTarget->GetGUID());
-                }
-
-                // Find gameobject by LowGuid
-                for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
-                {
-                    GameObject* go = pair.second;
-                    if (!go) continue;
-                    if (go->GetGUID().GetCounter() == lowGuid)
-                    {
-                        goTarget = go;
-                        break;
-                    }
                 }
 
                 if (goTarget)
@@ -926,6 +1892,13 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                         Player* playerTarget = ObjectAccessor::FindConnectedPlayer(guid);
                         if (playerTarget) target = playerTarget;
                     }
+                    if (!target)
+                    {
+                        BotBuddy::SetLastOutcome(bot, false, fmt::format(
+                            "nothing here has guid {} - it despawned. Pick a target from your visible list",
+                            lowGuid));
+                        return false;
+                    }
                 }
                 else
                 {
@@ -958,8 +1931,28 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                 return BotBuddyAI::TurnInQuest(bot, questId);
             }
             break;
+        case BotControlCommandType::SellJunk:
+            if (!command.args.empty())
+            {
+                uint32 vendorGuid = 0;
+                try { vendorGuid = std::stoul(command.args[0]); }
+                catch (const std::exception&) { return false; }
+                return BotBuddyAI::SellJunk(bot, vendorGuid);
+            }
+            break;
         case BotControlCommandType::Loot:
-            return BotBuddyAI::LootNearby(bot);
+        {
+            // Optional target: the model names a corpse, or we take the nearest one.
+            uint32 lootGuid = 0;
+            if (!command.args.empty())
+            {
+                try { lootGuid = std::stoul(command.args[0]); }
+                catch (const std::exception&) {
+                    LOG_ERROR("server.loading", "[OllamaBotBuddy] Invalid loot guid '{}'", command.args[0]);
+                }
+            }
+            return BotBuddyAI::LootCorpse(bot, lootGuid);
+        }
         default:
             break;
     }
@@ -1133,6 +2126,8 @@ std::string FormatCommandString(const BotControlCommand& command)
             break;
         case BotControlCommandType::Loot:
             ss << "loot";
+            for (const auto& arg : command.args)
+                ss << " " << arg;
             break;
         case BotControlCommandType::Follow:
             ss << "follow";

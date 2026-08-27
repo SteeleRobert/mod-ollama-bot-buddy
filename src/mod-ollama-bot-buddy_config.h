@@ -17,6 +17,10 @@ extern bool g_EnableOllamaBotBuddyJournal;
 // Constrain replies with a full JSON schema. Ollama's MLX runner ignores schemas
 // (ollama/ollama#17013); set false there to fall back to plain "json".
 extern bool g_OllamaBotBuddyStrictSchema;
+// Reasoning control for thinking models: -1 omit the field (default, required for
+// models that do not support thinking - Ollama rejects the flag on those),
+// 0 send "think": false, 1 send "think": true.
+extern int32 g_OllamaBotBuddyThink;
 
 class OllamaBotControlConfigWorldScript : public WorldScript
 {

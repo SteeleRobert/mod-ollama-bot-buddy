@@ -1433,6 +1433,12 @@ static std::string QueryOllamaLLM(const std::string& prompt)
         {"stream", false},
         {"format", g_OllamaBotBuddyStrictSchema ? schema : nlohmann::json("json")}
     };
+    // Thinking models route every token into "thinking" and return an empty
+    // "response" unless told not to - which reads as "the model returned nothing"
+    // on every single call. Omitted by default because Ollama rejects the flag
+    // for models with no thinking support.
+    if (g_OllamaBotBuddyThink >= 0)
+        requestData["think"] = (g_OllamaBotBuddyThink != 0);
     std::string requestDataStr = requestData.dump();
 
     struct curl_slist* headers = nullptr;

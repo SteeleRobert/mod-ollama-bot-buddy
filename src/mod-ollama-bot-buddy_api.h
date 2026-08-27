@@ -1,4 +1,10 @@
 #pragma once
+
+// Gameobject guids shown to the model are offset into their own numeric range so
+// they can never collide with creature spawn ids (see mod-ollama-bot-buddy_api.cpp).
+#ifndef GO_GUID_OFFSET
+#define GO_GUID_OFFSET 1000000000u
+#endif
 #include "Player.h"
 #include <string>
 #include <vector>

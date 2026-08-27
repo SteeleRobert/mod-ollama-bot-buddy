@@ -902,7 +902,7 @@ std::vector<std::string> GetVisibleLocations(Player* bot, float radius = 100.0f)
             go->GetName(),
             tag,
             goReach,
-            go->GetGUID().GetCounter(),
+            go->GetGUID().GetCounter() + GO_GUID_OFFSET, // object id space; see api.cpp
             go->GetGoType(),
             go->GetPositionX(),
             go->GetPositionY(),

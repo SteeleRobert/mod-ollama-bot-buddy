@@ -24,6 +24,13 @@
 
 // Constants for interaction and combat ranges
 #define INTERACTION_DISTANCE 5.5f
+
+// Creature and gameobject spawn ids are separate numbering spaces. Printing both
+// raw invited a collision the model cannot see: a hint named Felix's Chest by GO
+// guid 1937, resolution checked creatures first, found a Goretusk in Westfall
+// with the same number, and a level-5 rogue set off across Searing Gorge to talk
+// to it. Object guids are therefore printed offset into their own range, and
+// resolution routes by range instead of guessing. (Constant lives in the header.)
 #define ATTACK_DISTANCE 5.0f
 
 namespace BotBuddyAI
@@ -449,7 +456,7 @@ namespace BotBuddyAI
             if (GameObject* go = NearestGameObjectOfEntry(bot, entry))
                 return fmt::format(
                     "found inside {} (guid: {}, Position: {:.1f} {:.1f} {:.1f}, Distance: {:.1f}) - go there and interact with it",
-                    name, go->GetGUID().GetCounter(),
+                    name, go->GetGUID().GetCounter() + GO_GUID_OFFSET,
                     go->GetPositionX(), go->GetPositionY(), go->GetPositionZ(), bot->GetDistance(go));
         }
         if (!src->creatures.empty())
@@ -1477,13 +1484,19 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                 catch (...) { return false; }
 
                 WorldObject* target = nullptr;
-                for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
-                    if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
-                        { target = pair.second; break; }
-                if (!target)
+                if (lowGuid >= GO_GUID_OFFSET)
+                {
+                    uint32 goGuid = lowGuid - GO_GUID_OFFSET;
                     for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
+                        if (pair.second && pair.second->GetGUID().GetCounter() == goGuid)
+                            { target = pair.second; break; }
+                }
+                else
+                {
+                    for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
                         if (pair.second && pair.second->GetGUID().GetCounter() == lowGuid)
                             { target = pair.second; break; }
+                }
 
                 if (!target)
                 {
@@ -1528,33 +1541,27 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
                 Creature* creatureTarget = nullptr;
                 GameObject* goTarget = nullptr;
 
-                // Find creature by LowGuid
-                for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                if (lowGuid >= GO_GUID_OFFSET)
                 {
-                    Creature* c = pair.second;
-                    if (!c) continue;
-                    if (c->GetGUID().GetCounter() == lowGuid)
+                    uint32 goGuid = lowGuid - GO_GUID_OFFSET;
+                    for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
                     {
-                        creatureTarget = c;
-                        break;
+                        GameObject* go = pair.second;
+                        if (go && go->GetGUID().GetCounter() == goGuid) { goTarget = go; break; }
+                    }
+                }
+                else
+                {
+                    for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
+                    {
+                        Creature* c = pair.second;
+                        if (c && c->GetGUID().GetCounter() == lowGuid) { creatureTarget = c; break; }
                     }
                 }
 
                 if (creatureTarget)
                 {
                     return BotBuddyAI::Interact(bot, creatureTarget->GetGUID());
-                }
-
-                // Find gameobject by LowGuid
-                for (auto const& pair : bot->GetMap()->GetGameObjectBySpawnIdStore())
-                {
-                    GameObject* go = pair.second;
-                    if (!go) continue;
-                    if (go->GetGUID().GetCounter() == lowGuid)
-                    {
-                        goTarget = go;
-                        break;
-                    }
                 }
 
                 if (goTarget)

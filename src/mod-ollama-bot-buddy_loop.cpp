@@ -1766,7 +1766,19 @@ void OllamaBotControlLoop::OnUpdate(uint32 /*diff*/)
         // driving one MotionMaster fight each other, and a mid-combat "move_to"
         // would clear the chase the rotation just started. The model gets the
         // next word when the dust settles.
-        if (bot->IsInCombat()) continue;
+        if (bot->IsInCombat())
+        {
+            // Unprovoked aggro needs one push. In stock playerbots the switch to
+            // the combat engine happens inside AttackAction, run by a NON_COMBAT
+            // strategy that notices attackers - an engine we deliberately cleared.
+            // Without this, a hostile that jumps the bot mid-walk is answered by
+            // nobody: the empty non-combat engine does nothing, and the LLM is
+            // muted right here. Flip the engine and the rotation takes it from
+            // there - target selection included, via its own attackers value.
+            if (ai->GetState() != BOT_STATE_COMBAT)
+                ai->ChangeEngine(BOT_STATE_COMBAT);
+            continue;
+        }
 
         // Death is the dead engine's job too - release, corpse run, resurrect.
         // The LLM has no verb for any of that, and prompting a corpse just fills

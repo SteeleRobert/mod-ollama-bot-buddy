@@ -3,6 +3,7 @@
 #include "mod-ollama-bot-buddy_api.h"
 #include "mod-ollama-bot-buddy_handler.h"
 #include "mod-ollama-bot-buddy_journal.h"
+#include "Formulas.h"
 #include "PlayerbotMgr.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
@@ -853,6 +854,26 @@ std::vector<std::string> GetVisibleLocations(Player* bot, float radius = 100.0f)
         // move_to "to get in range" - and name the verb that applies, because a bare
         // "act on it now" gets read as "interact", and the bot spends an hour trying
         // to strike up a conversation with a wolf.
+        // XP worth and danger, stated as facts from the game's own formulas. The
+        // list showed raw levels and left the model to do WoW math from
+        // pretraining - so it spent turns killing 1-hp rabbits "for XP" it could
+        // never receive, and nothing warned it that a red mob ends the fight the
+        // other way.
+        std::string levelTag;
+        if (!c->isDead())
+        {
+            uint8 botLevel = bot->GetLevel();
+            uint8 cLevel   = c->GetLevel();
+            if (cLevel <= Acore::XP::GetGrayLevel(botLevel))
+                levelTag = " [NO XP - too weak to give you anything; ignore it unless a quest needs it]";
+            else if (cLevel >= botLevel + 5)
+                levelTag = " [DEADLY - far above your level, it WILL kill you; keep your distance]";
+            else if (cLevel >= botLevel + 3)
+                levelTag = " [HARD - above your level, a risky fight alone]";
+            if (c->isElite())
+                levelTag += " [ELITE - much tougher than its level suggests]";
+        }
+
         char const* verb =
             c->isDead()                                            ? "loot it"
           : c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_QUESTGIVER)   ? "talk to it to take or hand in quests"
@@ -868,12 +889,13 @@ std::vector<std::string> GetVisibleLocations(Player* bot, float radius = 100.0f)
             ? fmt::format(" [IN RANGE - {}]", verb)
             : " [too far - move closer first]";
         visible.push_back(fmt::format(
-            "{}: {}{}{}{} (guid: {}, Level: {}, HP: {}/{}, Position: {} {} {}, Distance: {:.1f})",
+            "{}: {}{}{}{}{} (guid: {}, Level: {}, HP: {}/{}, Position: {} {} {}, Distance: {:.1f})",
             type,
             c->GetName(),
             questGiver,
             questTarget,
             reach,
+            levelTag,
             c->GetGUID().GetCounter(),
             c->GetLevel(),
             c->GetHealth(),
@@ -1605,6 +1627,8 @@ How to choose:
 - Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
 - Anything marked [IN RANGE - ...] is close enough already, and the mark says which command to use on it. Use that command this turn; do not move to it again.
 - attack starts the fight and hands it to your character's combat training: the full ability rotation, positioning and targeting run automatically until the fight ends, and you decide again afterwards. Pick the target; do not micro-manage the fight.
+- Killing anything marked [NO XP] gains you nothing at all - it is a waste of a turn unless a quest objective names it.
+- Never attack anything marked [DEADLY], and give it a wide berth when walking: pick a move_to point that goes around it, not through it. [HARD] fights are winnable but chancy - prefer even fights when both advance a quest.
 - cast is for out-of-combat abilities: Stealth before approaching danger, Throw to pull something from range, a heal or buff before the next fight.
 - When your bags list grey junk and you are near a [VENDOR], sell it with sell_junk - it only sells worthless grey items, never gear or quest items, so it is always safe. Do not make a special trip just to sell; do it when you pass a vendor anyway.
 - interact is only for NPCs and objects you can talk to or use. Beasts and monsters are not; you attack those.

@@ -1497,6 +1497,53 @@ static std::string BuildBotPrompt(Player* bot)
     
 
     std::ostringstream oss;
+
+    // STATIC HEADER - byte-identical on every request from every bot, and it must
+    // stay that way: inference servers (vLLM automatic prefix caching, Ollama's
+    // per-model cache) reuse the KV cache for a shared leading prefix. With the
+    // instructions at the tail - where they sat originally - the prompt diverged
+    // at byte one and a prefill-bound workload measured a 0.0% prefix hit rate.
+    // Do not put anything per-bot, per-tick, or conditional above the marker line.
+    oss << R"(You are playing a character in World of Warcraft. Decide your single next action.
+
+Goal: level up and get better gear, mainly by taking and completing quests, killing things that give experience, and looting what you kill.
+
+How to choose:
+- Deal with immediate danger first: if you are low on health and in combat, retreat or heal before anything else.
+- Prefer whatever advances a quest objective listed below.
+- Only act on creatures, objects and NPCs that appear in your visible list, using the exact guid shown there.
+- You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
+- Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
+- Anything marked [IN RANGE - ...] is close enough already, and the mark says which command to use on it. Use that command this turn; do not move to it again.
+- attack starts the fight and hands it to your character's combat training: the full ability rotation, positioning and targeting run automatically until the fight ends, and you decide again afterwards. Pick the target; do not micro-manage the fight.
+- Killing anything marked [NO XP] gains you nothing at all - it is a waste of a turn unless a quest objective names it.
+- Never attack anything marked [DEADLY], and give it a wide berth when walking: pick a move_to point that goes around it, not through it. [HARD] fights are winnable but chancy - prefer even fights when both advance a quest.
+- cast is for out-of-combat abilities: Stealth before approaching danger, Throw to pull something from range, a heal or buff before the next fight.
+- When your bags list grey junk and you are near a [VENDOR], sell it with sell_junk - it only sells worthless grey items, never gear or quest items, so it is always safe. Do not make a special trip just to sell; do it when you pass a vendor anyway.
+- interact is only for NPCs and objects you can talk to or use. Beasts and monsters are not; you attack those.
+- Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
+
+Getting around:
+- To go to something you can see, use move_to_target with its guid and the pathing will route you there. Do not work out coordinates yourself.
+- Use move_to only to explore somewhere nothing is listed, using a waypoint or a point you choose.
+- You can only act on the creatures, objects and NPCs listed in your visible list. If a quest needs something not listed, travel until you find it.
+
+Reply with a single JSON object and nothing else, in exactly this shape:
+{"command":{"type":"<one of: move_to_target, move_to, attack, cast, interact, loot, sell_junk, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
+
+params by command type:
+  move_to      {"x":<float>,"y":<float>,"z":<float>}
+  attack       {"guid":<guid from your visible list>}
+  cast         {"spellid":<ID from your known spells>,"guid":<target guid; omit to cast on yourself>}
+  interact     {"guid":<guid from your visible list>}
+  loot         {"guid":<guid of a corpse marked DEAD (LOOTABLE)>}
+  sell_junk    {"guid":<guid of a [VENDOR] from your visible list>}
+  accept_quest {"id":<quest id>}
+  turn_in_quest{"id":<quest id>}
+
+=== YOUR CURRENT SITUATION (changes every turn) ===
+
+)";
     oss << "Bot state summary:\n";
     oss << "Name: " << botName << "\n";
     oss << "Level: " << botLevel << "\n";
@@ -1591,13 +1638,6 @@ static std::string BuildBotPrompt(Player* bot)
         for (const auto& entry : nearbyPlayers) oss << " - " << entry << "\n";
     }
 
-    if (!losLocs.empty() || !wps.empty()) {
-        oss << "Getting around:\n";
-        oss << " - To go to something you can see, use move_to_target with its guid and the pathing will route you there. Do not work out coordinates yourself.\n";
-        oss << " - Use move_to only to explore somewhere nothing is listed, using a waypoint or a point you choose.\n";
-        oss << " - You can only act on the creatures, objects and NPCs listed above. If a quest needs something not listed, travel until you find it.\n";
-    }
-
     oss << FormatPlayerMessagesPromptSegment(bot);
 
     std::vector<std::string> cmdHist = GetBotCommandHistory(bot);
@@ -1615,37 +1655,7 @@ static std::string BuildBotPrompt(Player* bot)
         LOG_INFO("server.loading", "[OllamaBotBuddy] Bot Snapshot for '{}': {}", botName, safeSnapshot);
     }
 
-    oss << R"(You are playing a character in World of Warcraft. Decide your single next action.
-
-Goal: level up and get better gear, mainly by taking and completing quests, killing things that give experience, and looting what you kill.
-
-How to choose:
-- Deal with immediate danger first: if you are low on health and in combat, retreat or heal before anything else.
-- Prefer whatever advances a quest objective listed above.
-- Only act on creatures, objects and NPCs that appear in your visible list, using the exact guid shown there.
-- You must be standing next to something to interact with it or loot it. If you are not close enough, move to it first; the outcome of your last action will tell you if you were too far.
-- Attack only living creatures. Loot only ones marked DEAD (LOOTABLE) - that mark means you killed it and it still has something on it. If no corpse is marked that way, there is nothing to loot, so go kill something instead.
-- Anything marked [IN RANGE - ...] is close enough already, and the mark says which command to use on it. Use that command this turn; do not move to it again.
-- attack starts the fight and hands it to your character's combat training: the full ability rotation, positioning and targeting run automatically until the fight ends, and you decide again afterwards. Pick the target; do not micro-manage the fight.
-- Killing anything marked [NO XP] gains you nothing at all - it is a waste of a turn unless a quest objective names it.
-- Never attack anything marked [DEADLY], and give it a wide berth when walking: pick a move_to point that goes around it, not through it. [HARD] fights are winnable but chancy - prefer even fights when both advance a quest.
-- cast is for out-of-combat abilities: Stealth before approaching danger, Throw to pull something from range, a heal or buff before the next fight.
-- When your bags list grey junk and you are near a [VENDOR], sell it with sell_junk - it only sells worthless grey items, never gear or quest items, so it is always safe. Do not make a special trip just to sell; do it when you pass a vendor anyway.
-- interact is only for NPCs and objects you can talk to or use. Beasts and monsters are not; you attack those.
-- Read the outcomes of your last actions before choosing. If the same command already failed for the same reason, that reason has not gone away - choose a different command, not the same one again.
-
-Reply with a single JSON object and nothing else, in exactly this shape:
-{"command":{"type":"<one of: move_to_target, move_to, attack, cast, interact, loot, sell_junk, accept_quest, turn_in_quest>","params":{}},"reasoning":"<one short sentence>","say":"<optional, what you say out loud>"}
-
-params by command type:
-  move_to      {"x":<float>,"y":<float>,"z":<float>}
-  attack       {"guid":<guid from your visible list>}
-  cast         {"spellid":<ID from your known spells>,"guid":<target guid; omit to cast on yourself>}
-  interact     {"guid":<guid from your visible list>}
-  loot         {"guid":<guid of a corpse marked DEAD (LOOTABLE)>}
-  sell_junk    {"guid":<guid of a [VENDOR] from your visible list>}
-  accept_quest {"id":<quest id>}
-  turn_in_quest{"id":<quest id>})";
+    oss << "Now choose your single next action, following the instructions at the top. Reply with only the JSON object.\n";
 
 
     return oss.str();
